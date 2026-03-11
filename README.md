@@ -52,3 +52,8 @@ To run Votor, follow these steps:
    ```
 
 Now you can use the various commands available in Votor.
+
+
+
+Local models that work well for sub:
+qwen2.5:1.5b
