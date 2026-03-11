@@ -23,4 +23,32 @@ Votor is a command-line tool designed for managing and analyzing projects using 
 To install Votor, clone the repository and install the required dependencies.
 
 ## Usage
-Run `votor` in your terminal to start using the tool.
+
+To run Votor, follow these steps:
+
+1. **Set up a Python virtual environment**:
+   ```bash
+   python -m venv venv
+   ```
+
+2. **Activate the virtual environment**:
+   - On Windows:
+     ```bash
+     venv\Scripts\activate
+     ```
+   - On macOS/Linux:
+     ```bash
+     source venv/bin/activate
+     ```
+
+3. **Install the required dependencies**:
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+4. **Run Votor**:
+   ```bash
+   votor
+   ```
+
+Now you can use the various commands available in Votor.
