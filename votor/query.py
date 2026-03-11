@@ -20,7 +20,8 @@ Use these chunks as your primary context to answer the user's question accuratel
 
 Rules:
 - Answer questions using the retrieved context first — do not read files unless the chunks are clearly insufficient
-- Only use read_file if the user explicitly asks to see a full file, or if a specific function/class is missing from the retrieved chunks
+- Use read_file when the user explicitly names a file and asks you to read, check, review, or validate it
+- Use read_file if a specific function/class is missing from the retrieved chunks and is needed to answer
 - Only use create_file or edit_file if the user explicitly asks you to create or modify something
 - Never delete files
 - Be concise but complete
@@ -34,7 +35,8 @@ Rules:
 ACTION_KEYWORDS = [
     "create", "edit", "modify", "update", "add", "delete",
     "remove", "write", "fix", "change", "refactor", "rename",
-    "make", "implement", "build", "generate"
+    "make", "implement", "build", "generate",
+    "read", "check", "review", "validate", "show", "open", "look at"
 ]
 
 def _is_action_request(text: str) -> bool:
@@ -176,6 +178,7 @@ def run_tool_loop(
     total_input  = 0
     total_output = 0
     iterations   = 0
+    _read_cache: dict[str, dict] = {}  # dedup within this turn only
 
     while iterations < max_iterations:
         iterations += 1
@@ -241,10 +244,31 @@ def run_tool_loop(
 
             console.print(f"  [#5c6370]→ {tool_name}([#61afef]{tool_params.get('path', '')}[/#61afef])[/#5c6370]")
 
-            tool_result = dispatch_tool(tool_name, tool_params)
+            if tool_name == "read_file":
+                path_key = tool_params.get("path", "")
+                if path_key in _read_cache:
+                    tool_result = _read_cache[path_key]
+                else:
+                    tool_result = dispatch_tool(tool_name, tool_params)
+                    _read_cache[path_key] = tool_result
+            else:
+                tool_result = dispatch_tool(tool_name, tool_params)
 
             if tool_name == "edit_file" and tool_result.get("success") and tool_result.get("diff_preview"):
                 show_diff(tool_result["diff_preview"], title=f"edit — {tool_params.get('path', '')}")
+
+            # truncate large read_file results before they enter context
+            CONTENT_CHAR_LIMIT = 8_000
+            if tool_name == "read_file" and tool_result.get("content"):
+                c = tool_result["content"]
+                if len(c) > CONTENT_CHAR_LIMIT:
+                    tool_result = dict(tool_result)  # don't mutate cache entry
+                    tool_result["content"] = c[:CONTENT_CHAR_LIMIT]
+                    tool_result["truncated"] = True
+                    tool_result["truncated_note"] = (
+                        f"Content truncated to {CONTENT_CHAR_LIMIT} chars. "
+                        "Use a more specific query or request a section."
+                    )
 
             if provider in ("openai", "groq", "ollama"):
                 messages.append({

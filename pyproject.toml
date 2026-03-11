@@ -27,6 +27,7 @@ dependencies = [
     "python-dotenv",
     "prompt_toolkit",
     "qdrant-client",
+    "pygments",
 ]
 
 [project.scripts]

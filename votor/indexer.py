@@ -10,6 +10,7 @@ from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskPr
 
 from votor.providers import embed_texts
 from votor.db import get_collection, upsert_chunks, delete_file_chunks, delete_all, make_id
+from votor.chunker import chunk_file, LANGUAGE_MAP
 
 console = Console()
 
@@ -43,33 +44,6 @@ def load_config() -> dict:
             "dist", "build", ".next"
         ]
     }
-
-
-# ---------------------------------------------------------------------------
-# Chunking
-# ---------------------------------------------------------------------------
-
-def chunk_text(text: str, chunk_size: int, overlap: int) -> list[str]:
-    """Split text into overlapping chunks by line boundaries."""
-    lines = text.splitlines(keepends=True)
-    chunks = []
-    current = []
-    current_len = 0
-
-    for line in lines:
-        current.append(line)
-        current_len += len(line.split())
-
-        if current_len >= chunk_size:
-            chunks.append("".join(current))
-            overlap_lines = current[-overlap:] if overlap < len(current) else current
-            current = list(overlap_lines)
-            current_len = sum(len(l.split()) for l in current)
-
-    if current:
-        chunks.append("".join(current))
-
-    return [c for c in chunks if c.strip()]
 
 
 # ---------------------------------------------------------------------------
@@ -189,10 +163,19 @@ def index_project(
                     progress.advance(task)
                     continue
 
-                chunks = chunk_text(text, chunk_size, chunk_overlap)
+                chunks = chunk_file(
+                    text=text,
+                    extension=filepath.suffix,
+                    chunk_size=chunk_size,
+                    chunk_overlap=chunk_overlap,
+                    rel_path=rel_path
+                )
                 if not chunks:
                     progress.advance(task)
                     continue
+
+                # Option B hook — summarize chunks before embedding (not implemented)
+                # chunks = summarize_chunks(chunks, config)
 
                 # Embed all chunks for this file
                 embeddings = embed_texts(chunks, config)
@@ -201,11 +184,13 @@ def index_project(
                 ids = [make_id(rel_path, i) for i in range(len(chunks))]
 
                 # Build metadata
+                lang_name = LANGUAGE_MAP.get(filepath.suffix, "text")
                 metadatas = [
                     {
                         "file":        rel_path,
                         "chunk_index": i,
                         "extension":   filepath.suffix,
+                        "language":    lang_name,
                         "indexed_at":  datetime.utcnow().isoformat()
                     }
                     for i in range(len(chunks))

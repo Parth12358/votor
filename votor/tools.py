@@ -12,6 +12,7 @@ from rich import box
 console = Console()
 
 PROJECT_ROOT = Path(".")
+MAX_FILE_BYTES = 512_000
 
 
 # ---------------------------------------------------------------------------
@@ -23,18 +24,38 @@ def read_file(path: str) -> dict:
     Read a file and return its contents.
     Returns dict with content, lines, exists.
     """
-    p = Path(path)
+    try:
+        p = (PROJECT_ROOT / path).resolve()
+        root = PROJECT_ROOT.resolve()
+        if not str(p).startswith(str(root)):
+            return {"content": "", "lines": 0, "exists": False,
+                    "error": "Access denied: path escapes project root"}
+    except Exception as e:
+        return {"content": "", "lines": 0, "exists": False, "error": str(e)}
+
     if not p.exists():
         return {"content": "", "lines": 0, "exists": False, "error": f"File not found: {path}"}
 
     try:
-        content = p.read_text(encoding="utf-8", errors="ignore")
-        return {
-            "content": content,
-            "lines":   len(content.splitlines()),
-            "exists":  True,
-            "path":    str(p)
+        file_bytes = p.stat().st_size
+        if file_bytes > MAX_FILE_BYTES:
+            return {"content": "", "lines": 0, "exists": True,
+                    "error": f"File too large ({file_bytes} bytes). Max is {MAX_FILE_BYTES}."}
+
+        raw = p.read_bytes()
+        content = raw.decode("utf-8", errors="replace")
+        had_errors = "\ufffd" in content
+
+        result = {
+            "content":    content,
+            "lines":      len(content.splitlines()),
+            "exists":     True,
+            "path":       str(p),
+            "size_bytes": file_bytes,
         }
+        if had_errors:
+            result["warning"] = "File contained non-UTF-8 bytes (shown as \ufffd)"
+        return result
     except Exception as e:
         return {"content": "", "lines": 0, "exists": False, "error": str(e)}
 
@@ -175,7 +196,7 @@ def git_commit(paths: list[str], message: str) -> dict:
             return {"success": False, "error": f"git add failed: {err}"}
 
     # Commit
-    ok, out = _run_git(["commit", "-m", message])
+    ok, out = _run_git(["commit", "-m", message, "--author", "votor <votor@local>"])
     if not ok:
         # Nothing to commit is not an error
         if "nothing to commit" in out.lower():

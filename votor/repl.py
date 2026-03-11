@@ -368,6 +368,8 @@ def handle_query(question: str, show_sources: bool):
             console.print(f"[#e06c75]{result['answer']}[/#e06c75]\n")
             return
         print_response(result, show_sources)
+    except KeyboardInterrupt:
+        console.print("\n[#5c6370]cancelled.[/#5c6370]\n")
     except Exception as e:
         console.print(f"[#e06c75]Query failed: {e}[/#e06c75]\n")
 
@@ -423,6 +425,8 @@ def main():
         _ctrl_c_count = 0
         inp = raw.strip()
         if not inp:
+            sys.stdout.write("\033[1A\033[2K")  # move up one line, clear it
+            sys.stdout.flush()
             continue
 
         if inp.startswith("/"):
