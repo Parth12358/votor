@@ -1,0 +1,42 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "votor"
+version = "0.1.0"
+description = "Project-aware coding assistant powered by vector search"
+requires-python = ">=3.10"
+keywords = ["ai", "vector", "coding", "assistant", "chromadb", "openai", "anthropic"]
+license = { text = "MIT" }
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "openai",
+    "anthropic",
+    "groq",
+    "fastapi",
+    "uvicorn",
+    "typer",
+    "rich",
+    "tiktoken",
+    "watchdog",
+    "python-dotenv",
+    "prompt_toolkit",
+    "qdrant-client",
+]
+
+[project.scripts]
+votor = "votor.repl:main"
+
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["votor*"]
+
+[project.urls]
+Homepage = "https://github.com/yourusername/votor"
+Issues = "https://github.com/yourusername/votor/issues"
