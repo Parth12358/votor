@@ -93,6 +93,11 @@ def validate_model(provider: str, model: str) -> tuple[bool, str]:
     if provider not in PROVIDERS:
         return False, f"Unknown provider '{provider}'"
 
+    # Ollama serves user-installed models — any model string is valid
+    # since we cannot know what the user has pulled locally
+    if provider == "ollama":
+        return True, ""
+
     available = PROVIDERS[provider]["models"]
     if model not in available:
         return False, f"Model '{model}' not available for {provider}. Choose from: {', '.join(available)}"
@@ -195,11 +200,20 @@ def call_llm(
 def get_embedding_provider(config: dict) -> str:
     """
     Determine which provider to use for embeddings.
-    Falls back to OpenAI if main provider has no embedding models.
+    Reads embedding_provider from config first.
+    Falls back to main_provider, then OpenAI if neither has embedding models.
     """
+    # Explicit embedding provider takes priority
+    explicit = config.get("embedding_provider")
+    if explicit and explicit in PROVIDERS and PROVIDERS[explicit]["embedding_models"]:
+        return explicit
+
+    # Fall back to main provider if it supports embeddings
     main = config.get("main_provider", "openai")
-    if PROVIDERS[main]["embedding_models"]:
+    if main in PROVIDERS and PROVIDERS[main]["embedding_models"]:
         return main
+
+    # Final fallback — OpenAI
     return EMBEDDING_FALLBACK.get(main, "openai")
 
 

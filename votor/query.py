@@ -12,37 +12,11 @@ from votor.tools import dispatch_tool, TOOL_DEFINITIONS, show_diff
 
 console = Console()
 
-CONFIG_FILE = Path(".vectormind/config.json")
+CONFIG_FILE  = Path(".vectormind/config.json")
+PROMPTS_FILE = Path(".vectormind/prompts.json")
 
-SYSTEM_PROMPT = """You are votor, a project-aware coding assistant.
-You have been given relevant code chunks retrieved from the project's vector database.
-Use these chunks as your primary context to answer the user's question accurately.
-
-Rules:
-- Answer questions using the retrieved context first — do not read files unless the chunks are clearly insufficient
-- Use read_file when the user explicitly names a file and asks you to read, check, review, or validate it
-- Use read_file if a specific function/class is missing from the retrieved chunks and is needed to answer
-- Only use create_file or edit_file if the user explicitly asks you to create or modify something
-- Never delete files
-- Be concise but complete
-- Do not hallucinate code that isn't in the context"""
-
-
-# ---------------------------------------------------------------------------
-# Action detection — only enable tools for explicit file actions
-# ---------------------------------------------------------------------------
-
-ACTION_KEYWORDS = [
-    "create", "edit", "modify", "update", "add", "delete",
-    "remove", "write", "fix", "change", "refactor", "rename",
-    "make", "implement", "build", "generate",
-    "read", "check", "review", "validate", "show", "open", "look at"
-]
-
-def _is_action_request(text: str) -> bool:
-    text_lower = text.lower()
-    return any(kw in text_lower for kw in ACTION_KEYWORDS)
-
+# Prompts are loaded from .vectormind/prompts.json at query time
+# to prevent prompt strings from being indexed and poisoning retrieval
 
 # ---------------------------------------------------------------------------
 # Config
@@ -58,6 +32,21 @@ def load_config() -> dict:
         "fallback_model":  "gpt-4o",
         "embedding_model": "text-embedding-3-small",
         "top_k":           5,
+    }
+
+
+def load_prompts() -> dict:
+    """
+    Load prompt strings from .vectormind/prompts.json.
+    Falls back to empty strings — surfaces as LLM errors, not silent failures.
+    """
+    if PROMPTS_FILE.exists():
+        with open(PROMPTS_FILE) as f:
+            return json.load(f)
+    return {
+        "system_prompt":         "",
+        "classification_prompt": "",
+        "sub_system_prompt":     "",
     }
 
 
@@ -377,6 +366,151 @@ def _call_anthropic_with_tools(provider: str, model: str, messages: list) -> dic
 
 
 # ---------------------------------------------------------------------------
+# Sub agent — intent classification
+# ---------------------------------------------------------------------------
+
+def classify_intent(question: str, config: dict) -> dict:
+    """
+    Use sub model to classify whether a query requires tool use.
+    Returns:
+        {
+            "needs_tools":  bool,
+            "likely_files": list[str],
+            "reason":       str,
+            "input_tokens":  int,
+            "output_tokens": int,
+        }
+    """
+    sub_provider = config.get("sub_provider", config.get("main_provider", "openai"))
+    sub_model    = config.get("sub_model",    config.get("main_model",    "gpt-4o-mini"))
+
+    classification_prompt = load_prompts()["classification_prompt"]
+
+    messages = [
+        {"role": "system", "content": classification_prompt},
+        {"role": "user",   "content": question}
+    ]
+
+    try:
+        result = call_llm(sub_provider, sub_model, messages, max_tokens=150)
+        content = result["content"].strip()
+
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+
+        parsed = json.loads(content)
+        return {
+            "needs_tools":   bool(parsed.get("needs_tools", False)),
+            "likely_files":  parsed.get("likely_files", []),
+            "reason":        parsed.get("reason", ""),
+            "input_tokens":  result["input_tokens"],
+            "output_tokens": result["output_tokens"],
+        }
+    except Exception:
+        return {"needs_tools": False, "likely_files": [], "reason": "classification_failed",
+                "input_tokens": 0, "output_tokens": 0}
+
+
+# ---------------------------------------------------------------------------
+# Sub agent — tool execution loop
+# ---------------------------------------------------------------------------
+
+def run_sub_tool_loop(
+    config: dict,
+    base_context: str,
+    question: str,
+    likely_files: list,
+    max_iterations: int = 8
+) -> dict:
+    """
+    Sub model tool execution loop. Reads files and assembles enriched context for main.
+    Returns:
+        {
+            "enriched_context": str,
+            "files_read":       list,
+            "tool_calls":       int,
+            "input_tokens":     int,
+            "output_tokens":    int,
+        }
+    """
+    sub_provider = config.get("sub_provider", config.get("main_provider", "openai"))
+    sub_model    = config.get("sub_model",    config.get("main_model",    "gpt-4o-mini"))
+
+    sub_system = load_prompts()["sub_system_prompt"]
+
+    messages = [
+        {"role": "system", "content": sub_system},
+        {"role": "user",   "content": (
+            f"The user asked: {question}\n\n"
+            f"Files likely needed: {likely_files}\n\n"
+            f"Read the necessary files using read_file."
+        )}
+    ]
+
+    result = run_tool_loop(
+        provider=sub_provider,
+        model=sub_model,
+        messages=messages,
+        allow_tools=True,
+        max_iterations=max_iterations
+    )
+
+    files_read = []
+    tool_content_blocks = []
+
+    for msg in messages:
+        if msg.get("role") == "tool":
+            try:
+                tool_result = json.loads(msg["content"])
+                if tool_result.get("exists") and tool_result.get("content"):
+                    path = tool_result.get("path", "unknown")
+                    content = tool_result["content"]
+                    files_read.append(path)
+                    tool_content_blocks.append(f"### {path} (full file)\n{content}")
+            except Exception:
+                pass
+
+    enriched_context = base_context
+    if tool_content_blocks:
+        enriched_context += "\n\n---\n\n## Files Retrieved by Sub Agent\n\n"
+        enriched_context += "\n\n---\n\n".join(tool_content_blocks)
+
+    return {
+        "enriched_context": enriched_context,
+        "files_read":       files_read,
+        "tool_calls":       len(files_read),
+        "input_tokens":     result.get("input_tokens", 0),
+        "output_tokens":    result.get("output_tokens", 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Sub agent — main failsafe signal detection
+# ---------------------------------------------------------------------------
+
+NEED_FILE_SIGNAL = '"need_file"'
+
+def detect_file_request(content: str) -> str | None:
+    """
+    Detect if main is signalling it needs a file.
+    Returns file path if signal detected, None otherwise.
+    Main signals by outputting: {"need_file": "path/to/file.py"}
+    """
+    if NEED_FILE_SIGNAL not in content:
+        return None
+    try:
+        start = content.index("{")
+        end   = content.rindex("}") + 1
+        block = json.loads(content[start:end])
+        path  = block.get("need_file")
+        return str(path) if path else None
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Fallback logic
 # ---------------------------------------------------------------------------
 
@@ -410,11 +544,14 @@ def run_query(
     if config is None:
         config = load_config()
 
-    top_k        = top_k or config.get("top_k", 5)
-    provider     = config.get("main_provider", "openai")
-    model        = config.get("main_model", "gpt-4o-mini")
-    fallback     = config.get("fallback_model", "gpt-4o")
-    allow_tools  = _is_action_request(question)
+    top_k    = top_k or config.get("top_k", 5)
+    provider = config.get("main_provider", "openai")
+    model    = config.get("main_model", "gpt-4o-mini")
+    fallback = config.get("fallback_model", "gpt-4o")
+
+    main_call_count  = 0
+    total_sub_input  = 0
+    total_sub_output = 0
 
     start_time = time.time()
 
@@ -449,36 +586,90 @@ def run_query(
             "error":           "no_context"
         }
 
-    # Step 3: Assemble context
-    context = assemble_context(
+    # Step 3: Assemble base context
+    base_context = assemble_context(
         results["documents"],
         results["metadatas"],
         results["scores"]
     )
 
-    # Step 4: Build messages
+    # Step 4: Sub classifies intent
+    t0 = time.time()
+    with console.status("[#5c6370]classifying intent...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
+        classification = classify_intent(question, config)
+    t_classify = round(time.time() - t0, 2)
+    total_sub_input  += classification["input_tokens"]
+    total_sub_output += classification["output_tokens"]
+
+    # Step 5: Sub runs tools if needed
+    enriched_context = base_context
+    files_read: list = []
+    t_sub_tools = 0.0
+
+    if classification["needs_tools"]:
+        t0 = time.time()
+        with console.status("[#5c6370]sub: reading files...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
+            sub_result = run_sub_tool_loop(
+                config=config,
+                base_context=base_context,
+                question=question,
+                likely_files=classification["likely_files"]
+            )
+        t_sub_tools = round(time.time() - t0, 2)
+        enriched_context  = sub_result["enriched_context"]
+        files_read        = sub_result["files_read"]
+        total_sub_input  += sub_result["input_tokens"]
+        total_sub_output += sub_result["output_tokens"]
+
+    # Step 6: Main call 1
+    prompts = load_prompts()
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user",   "content": f"## Retrieved Context\n\n{context}\n\n## Question\n\n{question}"}
+        {"role": "system", "content": prompts["system_prompt"]},
+        {"role": "user",   "content": f"## Context\n\n{enriched_context}\n\n## Question\n\n{question}"}
     ]
 
-    # Step 5: Call LLM
     t0 = time.time()
     with console.status(f"[#5c6370]calling {model}...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
-        llm_result = run_tool_loop(provider, model, messages, allow_tools=allow_tools)
+        main_call_count += 1
+        llm_result = call_llm(provider, model, messages)
     t_llm = round(time.time() - t0, 2)
 
-    # Fallback if needed
-    if needs_fallback(llm_result["content"], model, fallback):
+    # Step 7: Failsafe — did main signal it needs a file?
+    if main_call_count < 2:
+        requested_file = detect_file_request(llm_result["content"])
+        if requested_file:
+            with console.status("[#5c6370]sub: failsafe read...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
+                failsafe_result = run_sub_tool_loop(
+                    config=config,
+                    base_context=enriched_context,
+                    question=question,
+                    likely_files=[requested_file]
+                )
+            total_sub_input  += failsafe_result["input_tokens"]
+            total_sub_output += failsafe_result["output_tokens"]
+            files_read.extend(failsafe_result["files_read"])
+
+            # Main call 2 — hard cap, always final
+            messages = [
+                {"role": "system", "content": prompts["system_prompt"]},
+                {"role": "user",   "content": (
+                    f"## Context\n\n{failsafe_result['enriched_context']}"
+                    f"\n\n## Question\n\n{question}"
+                )}
+            ]
+            t0 = time.time()
+            with console.status(f"[#5c6370]calling {model} (2/2)...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
+                main_call_count += 1  # now at 2 — hard cap reached
+                llm_result = call_llm(provider, model, messages)
+            t_llm += round(time.time() - t0, 2)
+
+    # Step 8: Fallback only after main call 1 — never after call 2
+    if main_call_count == 1 and needs_fallback(llm_result["content"], model, fallback):
         console.print(f"[#5c6370]falling back to {fallback}...[/#5c6370]")
-        messages_copy = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user",   "content": f"## Retrieved Context\n\n{context}\n\n## Question\n\n{question}"}
-        ]
         t0 = time.time()
         with console.status(f"[#5c6370]calling {fallback}...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
-            llm_result = run_tool_loop(provider, fallback, messages_copy, allow_tools=allow_tools)
-        t_llm = round(time.time() - t0, 2)
+            llm_result = call_llm(provider, fallback, messages)
+        t_llm += round(time.time() - t0, 2)
 
     elapsed = round(time.time() - start_time, 2)
 
@@ -526,6 +717,8 @@ def run_query(
         "tokens_saved":    tokens_saved,
         "t_embed":         t_embed,
         "t_retrieve":      t_retrieve,
+        "t_classify":      t_classify,
+        "t_sub_tools":     t_sub_tools,
         "t_llm":           t_llm,
         "sources":         sources,
         "error":           None,

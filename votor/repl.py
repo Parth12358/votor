@@ -162,15 +162,19 @@ def print_response(result: dict, show_sources: bool):
         if result.get("savings_pct") else ""
     )
 
-    t_embed    = result.get("t_embed", 0)
-    t_retrieve = result.get("t_retrieve", 0)
-    t_llm      = result.get("t_llm", 0)
+    t_embed      = result.get("t_embed", 0)
+    t_retrieve   = result.get("t_retrieve", 0)
+    t_classify   = result.get("t_classify", 0)
+    t_sub_tools  = result.get("t_sub_tools", 0)
+    t_llm        = result.get("t_llm", 0)
 
     console.print(
         f"  [#5c6370]tokens[/#5c6370] [#abb2bf]{result['total_tokens']}[/#abb2bf]"
         f"  [#5c6370]cost[/#5c6370] [#e5c07b]${result['cost']:.4f}[/#e5c07b]"
         f"  [#5c6370]embed[/#5c6370] [#abb2bf]{t_embed}s[/#abb2bf]"
         f"  [#5c6370]retrieve[/#5c6370] [#abb2bf]{t_retrieve}s[/#abb2bf]"
+        f"  [#5c6370]classify[/#5c6370] [#abb2bf]{t_classify}s[/#abb2bf]"
+        f"  [#5c6370]sub[/#5c6370] [#abb2bf]{t_sub_tools}s[/#abb2bf]"
         f"  [#5c6370]llm[/#5c6370] [#abb2bf]{t_llm}s[/#abb2bf]"
         f"  [#5c6370]total[/#5c6370] [#abb2bf]{result['response_time']}s[/#abb2bf]"
         f"  [#5c6370]retrieval[/#5c6370] [#abb2bf]{result['retrieval_score']:.0%}[/#abb2bf]"

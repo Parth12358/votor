@@ -1,15 +1,17 @@
 {
   "CHANGELOG.md": "d41d8cd98f00b204e9800998ecf8427e",
+  "package-lock.json": "9659fd484fad7173cd79648b06c78434",
+  "package.json": "8a80554c91d9fca8acb82f023de02f11",
   "pyproject.toml": "3cb59458bc18200ebf54e7b62a186c3b",
-  "README.md": "2f2c4858c7f602fead322475cd23bbdc",
+  "README.md": "7c21adbf17574cde134f48a2e1748b03",
   "votor\\analytics.py": "7f05cb7f4c6f3712d36bea8807b8a18b",
   "votor\\chunker.py": "4b07d847149cc7eb7a88650c0f3a16c9",
   "votor\\dashboard.py": "a47f7cc89341dc6ebaed9f63b4c8aa8e",
   "votor\\db.py": "caa994c0cf066abad31ebdde390f1789",
   "votor\\indexer.py": "c077bb784359af5a697613b4d6a5bb4e",
   "votor\\init_flow.py": "77241a6256005ed888df1cf36815c41f",
-  "votor\\providers.py": "77b8dab57b10098866e748e885688ec2",
-  "votor\\query.py": "caff9d250dd8d0340e9569db6eb25bff",
+  "votor\\providers.py": "23509e7d96858dc84b1eedb6a989aabc",
+  "votor\\query.py": "83b396427917ef7f944dfc94fba31a8d",
   "votor\\repl.py": "ecd22791943761304d8fc890f1068670",
   "votor\\tools.py": "752bfe75386ce6cec29b9f778eb01a2e",
   "votor\\__init__.py": "162e7149a309928811b50b0fc0c6e70c",
@@ -17,7 +19,5 @@
   "votor.egg-info\\entry_points.txt": "99c416f9031ab2b5b407ed904d87bc79",
   "votor.egg-info\\requires.txt": "61fb0cac24acb32ee9b6526ae4d6d333",
   "votor.egg-info\\SOURCES.txt": "9b708cbf1c73e8cf665b2b3a62a429a7",
-  "votor.egg-info\\top_level.txt": "434a165a22c6b3ba672555b8765c1748",
-  "package-lock.json": "9659fd484fad7173cd79648b06c78434",
-  "package.json": "8a80554c91d9fca8acb82f023de02f11"
+  "votor.egg-info\\top_level.txt": "434a165a22c6b3ba672555b8765c1748"
 }
