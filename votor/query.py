@@ -618,16 +618,23 @@ def run_edit_mode(
         total_output += plan_result.get("output_tokens", 0)
 
         content = plan_result["content"].strip()
+
+        # Strip markdown fences
         if content.startswith("```"):
             content = content.split("```")[1]
             if content.startswith("json"):
                 content = content[4:]
             content = content.strip()
 
+        # Strip <tool_call> tags (some local models wrap output this way)
+        if "<tool_call>" in content:
+            content = content.replace("<tool_call>", "").replace("</tool_call>", "").strip()
+
         try:
             parsed = json.loads(content)
         except Exception:
             console.print(f"  [#e06c75]✗ main returned invalid plan JSON — aborting[/#e06c75]")
+            console.print(f"  [#5c6370]debug raw plan: {repr(content[:500])}[/#5c6370]")
             return {
                 "answer":         "Edit mode failed — main did not return a valid plan.",
                 "steps_executed": [],
@@ -743,6 +750,17 @@ def run_edit_mode(
                 "content":   step.get("content", ""),
                 "stage_only": "true",
             })
+            # Fallback — if file exists, overwrite via edit_file_lines (full file replacement)
+            if not result.get("success") and "already exists" in str(result.get("error", "")):
+                console.print(f"  [#5c6370]file exists — retrying as full file replacement[/#5c6370]")
+                content_lines = step.get("content", "").splitlines()
+                result = dispatch_tool("edit_file_lines", {
+                    "path":        file,
+                    "start_line":  "1",
+                    "end_line":    str(len(content_lines) + 100),  # cover entire file
+                    "new_content": step.get("content", ""),
+                    "stage_only":  "true",
+                })
 
         elif action == "delete":
             # Refuse delete if file is also being edited or created in this plan

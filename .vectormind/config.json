@@ -1,8 +1,8 @@
 {
-  "main_provider": "ollama",
+  "main_provider": "openai",
   "write_mode": "edit",
   "verify_changes": false,
-  "main_model": "qwen2.5:7b",
+  "main_model": "gpt-4o",
   "fallback_model": "qwen2.5:14b",
   "sub_provider": "ollama",
   "sub_model": "qwen2.5:7b",
