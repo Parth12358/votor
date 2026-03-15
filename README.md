@@ -1,4 +1,4 @@
-Votor Project Aware Coding Assistant is a command-line tool designed for managing and analyzing projects using vector databases.
+
 
 Votor is a command-line tool designed for managing and analyzing projects using vector databases.
 
