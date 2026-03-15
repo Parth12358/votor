@@ -437,14 +437,14 @@ def classify_intent(question: str, config: dict) -> dict:
 
         parsed = json.loads(content)
         return {
-            "needs_tools":   bool(parsed.get("needs_tools", False)),
-            "likely_files":  parsed.get("likely_files", []),
+            "intent":        parsed.get("intent", "none"),  # "none" | "read" | "write"
+            "files":         parsed.get("files", []),
             "reason":        parsed.get("reason", ""),
             "input_tokens":  result["input_tokens"],
             "output_tokens": result["output_tokens"],
         }
     except Exception:
-        return {"needs_tools": False, "likely_files": [], "reason": "classification_failed",
+        return {"intent": "none", "files": [], "reason": "classification_failed",
                 "input_tokens": 0, "output_tokens": 0}
 
 
@@ -518,6 +518,298 @@ def run_sub_tool_loop(
         "tool_calls":       len(files_read),
         "input_tokens":     result.get("input_tokens", 0),
         "output_tokens":    result.get("output_tokens", 0),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Edit mode orchestration
+# ---------------------------------------------------------------------------
+
+def run_edit_mode(
+    question: str,
+    config: dict,
+    base_context: str,
+    classification: dict,
+) -> dict:
+    """
+    Edit mode orchestration.
+    Sub reads files → main plans exact diffs → sub executes → main summarizes.
+    Always exactly 2 main calls.
+    """
+    provider     = config.get("main_provider", "openai")
+    model        = config.get("main_model",    "gpt-4o-mini")
+    sub_provider = config.get("sub_provider",  provider)
+    sub_model    = config.get("sub_model",     model)
+    prompts      = load_prompts()
+
+    total_input  = 0
+    total_output = 0
+
+    # -------------------------------------------------------------------------
+    # Phase 1: Sub reads identified files into messages thread
+    # -------------------------------------------------------------------------
+    console.print(f"  [#5c6370]sub[/#5c6370] [#c678dd]{sub_provider}/{sub_model}[/#c678dd] [#5c6370]→ reading files for edit context[/#5c6370]")
+
+    sub_messages = [
+        {"role": "system", "content": prompts["sub_system_prompt"]},
+        {"role": "user",   "content": (
+            f"The user wants to make changes to the project.\n\n"
+            f"Files to read: {classification['files']}\n\n"
+            f"Read all listed files using read_file."
+        )}
+    ]
+
+    # Cap iterations to number of files — one read per file maximum
+    max_iter = max(len(classification["files"]), 1)
+    run_tool_loop(
+        provider=sub_provider,
+        model=sub_model,
+        messages=sub_messages,
+        allow_tools=True,
+        max_iterations=max_iter
+    )
+
+    # Normalize absolute paths in tool results to relative paths
+    project_root = str(Path(".").resolve())
+    for msg in sub_messages:
+        if msg.get("role") == "tool":
+            try:
+                tool_result = json.loads(msg["content"])
+                if tool_result.get("path"):
+                    abs_path = tool_result["path"]
+                    if abs_path.startswith(project_root):
+                        rel = abs_path[len(project_root):].lstrip("\\/")
+                        tool_result["path"] = rel
+                        msg["content"] = json.dumps(tool_result)
+            except Exception:
+                pass
+
+    # -------------------------------------------------------------------------
+    # Phase 2: Main generates write plan (with file request loop, cap 3 rounds)
+    # -------------------------------------------------------------------------
+    plan_messages = [
+        {"role": "system", "content": prompts["write_plan_prompt"]},
+        {"role": "user",   "content": (
+            f"## Retrieved Context\n\n{base_context}\n\n"
+            f"## User Request\n\n{question}"
+        )}
+    ]
+
+    # Append sub's tool results (file contents) directly to plan messages
+    for msg in sub_messages:
+        if msg["role"] in ("assistant", "tool") or (
+            msg["role"] == "user" and msg not in (sub_messages[0], sub_messages[1])
+        ):
+            plan_messages.append(msg)
+
+    file_request_rounds = 0
+    MAX_FILE_REQUEST_ROUNDS = 3
+    write_plan = None
+
+    while file_request_rounds <= MAX_FILE_REQUEST_ROUNDS:
+        console.print(f"  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ generating edit plan (round {file_request_rounds + 1})[/#5c6370]")
+
+        from votor.providers import stream_llm
+        plan_result = _stream_to_console(
+            stream_llm(provider, model, plan_messages, max_tokens=4096),
+            show_thinking=False
+        )
+        total_input  += plan_result.get("input_tokens", 0)
+        total_output += plan_result.get("output_tokens", 0)
+
+        content = plan_result["content"].strip()
+        if content.startswith("```"):
+            content = content.split("```")[1]
+            if content.startswith("json"):
+                content = content[4:]
+            content = content.strip()
+
+        try:
+            parsed = json.loads(content)
+        except Exception:
+            console.print(f"  [#e06c75]✗ main returned invalid plan JSON — aborting[/#e06c75]")
+            return {
+                "answer":         "Edit mode failed — main did not return a valid plan.",
+                "steps_executed": [],
+                "input_tokens":   total_input,
+                "output_tokens":  total_output,
+                "model":          model,
+                "provider":       provider,
+            }
+
+        if "need_files" in parsed and file_request_rounds < MAX_FILE_REQUEST_ROUNDS:
+            needed = parsed["need_files"]
+            console.print(f"  [#5c6370]main requested files:[/#5c6370] [#61afef]{needed}[/#61afef]")
+
+            extra_messages = [
+                {"role": "system", "content": prompts["sub_system_prompt"]},
+                {"role": "user",   "content": f"Read these files: {needed}"}
+            ]
+            run_tool_loop(
+                provider=sub_provider,
+                model=sub_model,
+                messages=extra_messages,
+                allow_tools=True,
+                max_iterations=len(needed) + 2
+            )
+            for msg in extra_messages:
+                if msg["role"] in ("assistant", "tool"):
+                    plan_messages.append(msg)
+
+            plan_messages.append({
+                "role": "user",
+                "content": "Here are the additional files you requested. Now output the write plan."
+            })
+            file_request_rounds += 1
+            continue
+
+        if "write_plan" in parsed:
+            write_plan = parsed["write_plan"]
+            break
+
+        console.print(f"  [#e06c75]✗ main returned unexpected response — aborting[/#e06c75]")
+        return {
+            "answer":         "Edit mode failed — unexpected response from main.",
+            "steps_executed": [],
+            "input_tokens":   total_input,
+            "output_tokens":  total_output,
+            "model":          model,
+            "provider":       provider,
+        }
+
+    if not write_plan:
+        return {
+            "answer":         "Edit mode failed — could not generate plan after maximum file request rounds.",
+            "steps_executed": [],
+            "input_tokens":   total_input,
+            "output_tokens":  total_output,
+            "model":          model,
+            "provider":       provider,
+        }
+
+    # -------------------------------------------------------------------------
+    # Phase 3: Sub executes plan steps mechanically
+    # -------------------------------------------------------------------------
+    console.print(f"\n  [#5c6370]executing [#abb2bf]{len(write_plan)}[/#abb2bf] step(s)...[/#5c6370]\n")
+
+    steps_executed = []
+
+    # Build set of files being edited or created — delete is refused for these
+    protected_files = {
+        step.get("file", "")
+        for step in write_plan
+        if step.get("action") in ("edit", "create")
+    }
+
+    for i, step in enumerate(write_plan):
+        action = step.get("action")
+        file   = step.get("file", "")
+        n      = i + 1
+        total  = len(write_plan)
+
+        # Normalize to relative path in case main used absolute path
+        project_root = str(Path(".").resolve())
+        if file.startswith(project_root):
+            file = file[len(project_root):].lstrip("\\/")
+            step["file"] = file  # update step so dispatch_tool also uses relative path
+
+        # Guard — never allow modifications to .vectormind
+        if ".vectormind" in file:
+            console.print(f"  [#e06c75]✗ refused — .vectormind is protected[/#e06c75]")
+            steps_executed.append({
+                "action":       action,
+                "file":         file,
+                "success":      False,
+                "error":        "refused — .vectormind is protected",
+                "diff_preview": None,
+            })
+            continue
+
+        console.print(f"  [#5c6370][{n}/{total}][/#5c6370] [#e5c07b]{action}[/#e5c07b] [#61afef]{file}[/#61afef]")
+
+        if action == "edit":
+            result = dispatch_tool("edit_file", {
+                "path":    file,
+                "old_str": step.get("old_str", ""),
+                "new_str": step.get("new_str", ""),
+            })
+            if result.get("success") and result.get("diff_preview"):
+                show_diff(result["diff_preview"], title=f"edit — {file}")
+
+        elif action == "create":
+            result = dispatch_tool("create_file", {
+                "path":    file,
+                "content": step.get("content", ""),
+            })
+
+        elif action == "delete":
+            # Refuse delete if file is also being edited or created in this plan
+            if file in protected_files:
+                result = {"success": False, "error": "refused — cannot delete a file that is also being edited in this plan"}
+                console.print(f"  [#e06c75]✗ refused — {file} is also being edited in this plan[/#e06c75]")
+            else:
+                console.print(f"  [#e06c75]⚠ delete requested:[/#e06c75] [#61afef]{file}[/#61afef]")
+                console.print(f"  [#5c6370]Type [#e06c75]yes[/#e06c75] to confirm or anything else to skip:[/#5c6370] ", end="")
+                try:
+                    confirm = input().strip().lower()
+                except Exception:
+                    confirm = ""
+                if confirm == "yes":
+                    result = dispatch_tool("delete_file", {"path": file})
+                else:
+                    result = {"success": False, "error": "skipped by user"}
+                    console.print(f"  [#5c6370]skipped.[/#5c6370]")
+
+        else:
+            result = {"success": False, "error": f"unknown action: {action}"}
+
+        status = "[#00ffaa]✓[/#00ffaa]" if result.get("success") else "[#e06c75]✗[/#e06c75]"
+        if result.get("success"):
+            console.print(f"  {status} [#5c6370]{action} complete[/#5c6370]")
+        else:
+            console.print(f"  {status} [#e06c75]{result.get('error', 'unknown error')}[/#e06c75]")
+
+        steps_executed.append({
+            "action":       action,
+            "file":         file,
+            "success":      result.get("success", False),
+            "error":        result.get("error"),
+            "diff_preview": result.get("diff_preview"),
+        })
+
+    # -------------------------------------------------------------------------
+    # Phase 4: Main summarizes results
+    # -------------------------------------------------------------------------
+    from votor.tools import git_log
+    recent_commits = git_log(limit=len(write_plan))
+
+    summary_messages = [
+        {"role": "system", "content": prompts["write_summary_prompt"]},
+        {"role": "user",   "content": (
+            f"## User Request\n\n{question}\n\n"
+            f"## Plan That Was Executed\n\n{json.dumps(write_plan, indent=2)}\n\n"
+            f"## Execution Results\n\n{json.dumps(steps_executed, indent=2)}\n\n"
+            f"## Git Commits Made\n\n{json.dumps(recent_commits, indent=2)}"
+        )}
+    ]
+
+    console.print(f"\n  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ summarizing results[/#5c6370]")
+
+    from votor.providers import stream_llm
+    summary_result = _stream_to_console(
+        stream_llm(provider, model, summary_messages, max_tokens=1024),
+        show_thinking=False
+    )
+    total_input  += summary_result.get("input_tokens", 0)
+    total_output += summary_result.get("output_tokens", 0)
+
+    return {
+        "answer":         summary_result["content"],
+        "steps_executed": steps_executed,
+        "input_tokens":   total_input,
+        "output_tokens":  total_output,
+        "model":          model,
+        "provider":       provider,
     }
 
 
@@ -664,6 +956,12 @@ def run_query(
         results["scores"]
     )
 
+    avg_score = sum(results["scores"]) / len(results["scores"]) if results["scores"] else 0
+    sources = [
+        {"file": meta.get("file", "unknown"), "chunk": meta.get("chunk_index", 0), "score": score}
+        for meta, score in zip(results["metadatas"], results["scores"])
+    ]
+
     # Step 4: Sub classifies intent
     sub_provider = config.get("sub_provider", config.get("main_provider", "openai"))
     sub_model    = config.get("sub_model", config.get("main_model", "gpt-4o-mini"))
@@ -672,7 +970,7 @@ def run_query(
     with console.status("[#5c6370]classifying intent...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
         classification = classify_intent(question, config)
     t_classify = round(time.time() - t0, 2)
-    console.print(f"  [#5c6370]sub classified: needs_tools=[/#5c6370][#e5c07b]{classification['needs_tools']}[/#e5c07b] [#5c6370]reason=[/#5c6370][#abb2bf]{classification['reason']}[/#abb2bf]")
+    console.print(f"  [#5c6370]sub classified: intent=[/#5c6370][#e5c07b]{classification['intent']}[/#e5c07b] [#5c6370]reason=[/#5c6370][#abb2bf]{classification['reason']}[/#abb2bf]")
     total_sub_input  += classification["input_tokens"]
     total_sub_output += classification["output_tokens"]
 
@@ -681,15 +979,68 @@ def run_query(
     files_read: list = []
     t_sub_tools = 0.0
 
-    if classification["needs_tools"]:
-        console.print(f"  [#5c6370]sub[/#5c6370] [#c678dd]{sub_provider}/{sub_model}[/#c678dd] [#5c6370]→ tool loop  files=[/#5c6370][#61afef]{classification['likely_files']}[/#61afef]")
+    # Write intent — route to edit mode
+    if classification["intent"] == "write":
+        write_mode = config.get("write_mode", "edit")
+
+        if write_mode == "edit":
+            t0 = time.time()
+            edit_result = run_edit_mode(
+                question=question,
+                config=config,
+                base_context=base_context,
+                classification=classification,
+            )
+            t_llm = round(time.time() - t0, 2)
+
+            # Auto /update after edit to re-index changed files
+            try:
+                from votor.indexer import index_project
+                invalidate_full_context_cache()
+                console.print(f"\n  [#5c6370]auto-updating index...[/#5c6370]")
+                index_project(incremental=True, force=False, config=config)
+                invalidate_full_context_cache()
+                console.print(f"  [#00ffaa]✓[/#00ffaa] [#5c6370]index updated[/#5c6370]\n")
+            except Exception as e:
+                console.print(f"  [#e06c75]index update failed: {e}[/#e06c75]\n")
+
+            elapsed = round(time.time() - start_time, 2)
+            cost    = calculate_cost(
+                model=edit_result["model"],
+                input_tokens=edit_result["input_tokens"],
+                output_tokens=edit_result["output_tokens"]
+            )
+
+            return {
+                "answer":          edit_result["answer"],
+                "model":           edit_result["model"],
+                "provider":        edit_result["provider"],
+                "input_tokens":    edit_result["input_tokens"],
+                "output_tokens":   edit_result["output_tokens"],
+                "total_tokens":    edit_result["input_tokens"] + edit_result["output_tokens"],
+                "cost":            cost,
+                "response_time":   elapsed,
+                "retrieval_score": avg_score,
+                "savings_pct":     0,
+                "tokens_saved":    0,
+                "t_embed":         t_embed,
+                "t_retrieve":      t_retrieve,
+                "t_classify":      t_classify,
+                "t_sub_tools":     0.0,
+                "t_llm":           t_llm,
+                "sources":         sources,
+                "error":           None,
+            }
+
+    if classification["intent"] == "read":
+        console.print(f"  [#5c6370]sub[/#5c6370] [#c678dd]{sub_provider}/{sub_model}[/#c678dd] [#5c6370]→ tool loop  files=[/#5c6370][#61afef]{classification['files']}[/#61afef]")
         t0 = time.time()
         with console.status("[#5c6370]sub: reading files...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
             sub_result = run_sub_tool_loop(
                 config=config,
                 base_context=base_context,
                 question=question,
-                likely_files=classification["likely_files"]
+                likely_files=classification["files"]
             )
         t_sub_tools = round(time.time() - t0, 2)
         enriched_context  = sub_result["enriched_context"]
@@ -768,12 +1119,6 @@ def run_query(
     tokens_used  = llm_result["input_tokens"]
     tokens_saved = max(0, full_tokens - tokens_used)
     savings_pct  = round((tokens_saved / full_tokens * 100), 1) if full_tokens > 0 else 0
-    avg_score    = sum(results["scores"]) / len(results["scores"]) if results["scores"] else 0
-
-    sources = [
-        {"file": meta.get("file", "unknown"), "chunk": meta.get("chunk_index", 0), "score": score}
-        for meta, score in zip(results["metadatas"], results["scores"])
-    ]
 
     try:
         log_query(

@@ -1,7 +1,8 @@
 {
   "main_provider": "ollama",
+  "write_mode": "edit",
   "main_model": "qwen2.5:7b",
-  "fallback_model": "gpt-4o",
+  "fallback_model": "qwen2.5:14b",
   "sub_provider": "ollama",
   "sub_model": "qwen2.5:7b",
   "embedding_provider": "ollama",
