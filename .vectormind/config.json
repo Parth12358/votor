@@ -1,6 +1,7 @@
 {
   "main_provider": "ollama",
   "write_mode": "edit",
+  "verify_changes": false,
   "main_model": "qwen2.5:7b",
   "fallback_model": "qwen2.5:14b",
   "sub_provider": "ollama",

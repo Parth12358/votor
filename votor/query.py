@@ -728,18 +728,20 @@ def run_edit_mode(
         console.print(f"  [#5c6370][{n}/{total}][/#5c6370] [#e5c07b]{action}[/#e5c07b] [#61afef]{file}[/#61afef]")
 
         if action == "edit":
-            result = dispatch_tool("edit_file", {
-                "path":    file,
-                "old_str": step.get("old_str", ""),
-                "new_str": step.get("new_str", ""),
+            result = dispatch_tool("edit_file_lines", {
+                "path":        file,
+                "start_line":  str(step.get("start_line", 1)),
+                "end_line":    str(step.get("end_line", 1)),
+                "new_content": step.get("new_content", ""),
+                "stage_only":  "true",
             })
-            if result.get("success") and result.get("diff_preview"):
-                show_diff(result["diff_preview"], title=f"edit — {file}")
+            # diff is shown inside edit_file_lines — no need to show again here
 
         elif action == "create":
             result = dispatch_tool("create_file", {
-                "path":    file,
-                "content": step.get("content", ""),
+                "path":      file,
+                "content":   step.get("content", ""),
+                "stage_only": "true",
             })
 
         elif action == "delete":
@@ -755,7 +757,7 @@ def run_edit_mode(
                 except Exception:
                     confirm = ""
                 if confirm == "yes":
-                    result = dispatch_tool("delete_file", {"path": file})
+                    result = dispatch_tool("delete_file", {"path": file, "stage_only": "true"})
                 else:
                     result = {"success": False, "error": "skipped by user"}
                     console.print(f"  [#5c6370]skipped.[/#5c6370]")
@@ -777,19 +779,80 @@ def run_edit_mode(
             "diff_preview": result.get("diff_preview"),
         })
 
-    # -------------------------------------------------------------------------
-    # Phase 4: Main summarizes results
-    # -------------------------------------------------------------------------
-    from votor.tools import git_log
-    recent_commits = git_log(limit=len(write_plan))
+    # Batch commit all staged changes after all steps complete
+    from votor.tools import git_commit_staged
+    successful_files = [s["file"] for s in steps_executed if s["success"]]
+    if successful_files:
+        files_summary = ", ".join(successful_files[:3])
+        if len(successful_files) > 3:
+            files_summary += f" +{len(successful_files) - 3} more"
+        git_commit_staged(f"votor: edit session — {files_summary}")
+        console.print(
+            f"  [#00ffaa]✓[/#00ffaa] [#5c6370]committed {len(successful_files)} file(s)[/#5c6370]"
+        )
 
+    # -------------------------------------------------------------------------
+    # Phase 4: Verification (if enabled)
+    # -------------------------------------------------------------------------
+    from votor.tools import git_log, read_file as read_file_tool
+    recent_commits = git_log(limit=len(write_plan))
+    verify_changes = config.get("verify_changes", False)
+
+    if verify_changes:
+        # Read full current contents of all edited/created files
+        changed_files = list({
+            step["file"] for step in steps_executed
+            if step["success"] and step["action"] in ("edit", "create")
+        })
+
+        file_contents_after = {}
+        for f in changed_files:
+            result = read_file_tool(f)
+            if result.get("exists"):
+                file_contents_after[f] = result["content"]
+
+        # Build diffs from steps_executed
+        diffs = [
+            s["diff_preview"] for s in steps_executed
+            if s.get("diff_preview")
+        ]
+
+        verify_messages = [
+            {"role": "system", "content": prompts["verify_changes_prompt"]},
+            {"role": "user",   "content": (
+                f"## User Request\n\n{question}\n\n"
+                f"## Changes Made (diffs)\n\n" + "\n\n".join(diffs) + "\n\n"
+                f"## Full File Contents After Edit\n\n" +
+                "\n\n".join(f"### {f}\n```\n{c}\n```" for f, c in file_contents_after.items())
+            )}
+        ]
+
+        console.print(f"\n  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ verifying changes[/#5c6370]")
+
+        from votor.providers import stream_llm
+        verify_result = _stream_to_console(
+            stream_llm(provider, model, verify_messages, max_tokens=1024),
+            show_thinking=False
+        )
+        total_input  += verify_result.get("input_tokens", 0)
+        total_output += verify_result.get("output_tokens", 0)
+
+        # Append verification result to summary context
+        verification_note = f"## Verification Result\n\n{verify_result['content']}"
+    else:
+        verification_note = ""
+
+    # -------------------------------------------------------------------------
+    # Phase 5: Main summarizes results
+    # -------------------------------------------------------------------------
     summary_messages = [
         {"role": "system", "content": prompts["write_summary_prompt"]},
         {"role": "user",   "content": (
             f"## User Request\n\n{question}\n\n"
             f"## Plan That Was Executed\n\n{json.dumps(write_plan, indent=2)}\n\n"
             f"## Execution Results\n\n{json.dumps(steps_executed, indent=2)}\n\n"
-            f"## Git Commits Made\n\n{json.dumps(recent_commits, indent=2)}"
+            f"## Git Commits Made\n\n{json.dumps(recent_commits, indent=2)}\n\n"
+            + verification_note
         )}
     ]
 
@@ -1002,7 +1065,10 @@ def run_query(
                 invalidate_full_context_cache()
                 console.print(f"  [#00ffaa]✓[/#00ffaa] [#5c6370]index updated[/#5c6370]\n")
             except Exception as e:
-                console.print(f"  [#e06c75]index update failed: {e}[/#e06c75]\n")
+                if "already accessed" in str(e):
+                    console.print(f"  [#5c6370]run [#00ffaa]/update[/#00ffaa] to re-index changes[/#5c6370]\n")
+                else:
+                    console.print(f"  [#e06c75]index update failed: {e}[/#e06c75]\n")
 
             elapsed = round(time.time() - start_time, 2)
             cost    = calculate_cost(

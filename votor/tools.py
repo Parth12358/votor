@@ -60,7 +60,7 @@ def read_file(path: str) -> dict:
         return {"content": "", "lines": 0, "exists": False, "error": str(e)}
 
 
-def create_file(path: str, content: str, commit_msg: Optional[str] = None) -> dict:
+def create_file(path: str, content: str, commit_msg: Optional[str] = None, stage_only: bool = False) -> dict:
     """
     Create a new file with given content.
     Optionally commits to git with votor: prefix.
@@ -75,15 +75,20 @@ def create_file(path: str, content: str, commit_msg: Optional[str] = None) -> di
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
 
-        msg = commit_msg or f"votor: created {path}"
-        git_commit([path], msg)
+        if stage_only:
+            ok, err = _run_git(["add", path])
+            if not ok:
+                return {"success": False, "error": f"git add failed: {err}"}
+        else:
+            msg = commit_msg or f"votor: created {path}"
+            git_commit([path], msg)
 
         return {"success": True, "path": str(p), "lines": len(content.splitlines())}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
 
-def edit_file(path: str, old_str: str, new_str: str, commit_msg: Optional[str] = None) -> dict:
+def edit_file(path: str, old_str: str, new_str: str, commit_msg: Optional[str] = None, stage_only: bool = False) -> dict:
     """
     Replace old_str with new_str in file.
     old_str must appear exactly once.
@@ -97,19 +102,28 @@ def edit_file(path: str, old_str: str, new_str: str, commit_msg: Optional[str] =
 
     content = p.read_text(encoding="utf-8", errors="ignore")
 
-    count = content.count(old_str)
+    # Normalize line endings to handle CRLF vs LF mismatch
+    content_normalized = content.replace("\r\n", "\n")
+    old_str_normalized = old_str.replace("\r\n", "\n")
+
+    count = content_normalized.count(old_str_normalized)
     if count == 0:
         return {"success": False, "error": f"String not found in {path}"}
     if count > 1:
         return {"success": False, "error": f"String appears {count} times in {path}. Make it more specific."}
 
-    new_content = content.replace(old_str, new_str, 1)
+    new_content = content_normalized.replace(old_str_normalized, new_str, 1)
 
     try:
         p.write_text(new_content, encoding="utf-8")
 
-        msg = commit_msg or f"votor: edited {path}"
-        git_commit([path], msg)
+        if stage_only:
+            ok, err = _run_git(["add", path])
+            if not ok:
+                return {"success": False, "error": f"git add failed: {err}"}
+        else:
+            msg = commit_msg or f"votor: edited {path}"
+            git_commit([path], msg)
 
         diff = _make_diff_preview(old_str, new_str, path)
         return {"success": True, "path": str(p), "diff_preview": diff}
@@ -117,7 +131,100 @@ def edit_file(path: str, old_str: str, new_str: str, commit_msg: Optional[str] =
         return {"success": False, "error": str(e)}
 
 
-def delete_file(path: str, commit_msg: Optional[str] = None) -> dict:
+def edit_file_lines(
+    path: str,
+    start_line: int,
+    end_line: int,
+    new_content: str,
+    commit_msg: Optional[str] = None,
+    stage_only: bool = False
+) -> dict:
+    """
+    Edit a file by replacing a range of lines with new_content.
+
+    Args:
+        path:        Relative path to the file
+        start_line:  First line to replace (1-indexed)
+        end_line:    Last line to replace (1-indexed, inclusive)
+                     If end_line < start_line — insert before start_line, nothing replaced
+        new_content: Replacement text (include trailing newline if needed)
+        commit_msg:  Optional git commit message
+
+    Returns dict with success, path, diff_preview, error.
+    """
+    p = Path(path)
+
+    if not p.exists():
+        return {"success": False, "error": f"File not found: {path}"}
+
+    try:
+        content = p.read_text(encoding="utf-8", errors="replace")
+        lines   = content.splitlines(keepends=True)
+        total   = len(lines)
+
+        # Validate line range
+        if start_line < 1:
+            return {"success": False, "error": f"start_line must be >= 1, got {start_line}"}
+        if start_line > total + 1:
+            return {"success": False, "error": f"start_line {start_line} exceeds file length {total}"}
+
+        # Clamp end_line
+        end_line = min(end_line, total)
+
+        # Determine operation
+        is_insert = end_line < start_line
+
+        if is_insert:
+            # Insert before start_line — nothing replaced
+            insert_idx = start_line - 1
+            old_str    = ""
+            new_lines  = (
+                lines[:insert_idx]
+                + [new_content if new_content.endswith("\n") else new_content + "\n"]
+                + lines[insert_idx:]
+            )
+        else:
+            # Replace lines start_line..end_line inclusive
+            start_idx = start_line - 1
+            end_idx   = end_line        # exclusive slice end
+            old_str   = "".join(lines[start_idx:end_idx])
+            new_lines = (
+                lines[:start_idx]
+                + [new_content if new_content.endswith("\n") else new_content + "\n"]
+                + lines[end_idx:]
+            )
+
+        new_content_full = "".join(new_lines)
+
+        p.write_text(new_content_full, encoding="utf-8")
+
+        if stage_only:
+            ok, err = _run_git(["add", path])
+            if not ok:
+                return {"success": False, "error": f"git add failed: {err}"}
+        else:
+            msg = commit_msg or f"votor: edited {path} (lines {start_line}-{end_line})"
+            git_commit([path], msg)
+
+        diff = _make_diff_preview(old_str, new_content, path)
+
+        # Show diff to user
+        show_diff(diff, title=f"edit lines {start_line}-{end_line} — {path}")
+
+        return {
+            "success":      True,
+            "path":         str(p),
+            "start_line":   start_line,
+            "end_line":     end_line,
+            "is_insert":    is_insert,
+            "diff_preview": diff,
+        }
+
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+def delete_file(path: str, commit_msg: Optional[str] = None, stage_only: bool = False) -> dict:
     """
     Delete a file and commit the deletion.
     Returns dict with success, error.
@@ -129,8 +236,13 @@ def delete_file(path: str, commit_msg: Optional[str] = None) -> dict:
 
     try:
         p.unlink()
-        msg = commit_msg or f"votor: deleted {path}"
-        git_commit([path], msg)
+        if stage_only:
+            ok, err = _run_git(["add", path])
+            if not ok:
+                return {"success": False, "error": f"git add failed: {err}"}
+        else:
+            msg = commit_msg or f"votor: deleted {path}"
+            git_commit([path], msg)
         return {"success": True, "path": str(p)}
     except Exception as e:
         return {"success": False, "error": str(e)}
@@ -199,6 +311,23 @@ def git_commit(paths: list[str], message: str) -> dict:
     ok, out = _run_git(["commit", "-m", message, "--author", "votor <votor@local>"])
     if not ok:
         # Nothing to commit is not an error
+        if "nothing to commit" in out.lower():
+            return {"success": True, "message": "nothing to commit"}
+        return {"success": False, "error": out}
+
+    return {"success": True, "message": message, "output": out}
+
+
+def git_commit_staged(message: str) -> dict:
+    """
+    Commit all currently staged files in one batch commit.
+    Used by edit mode to commit all changes at the end of a session.
+    """
+    if not message.startswith("votor:"):
+        message = f"votor: {message}"
+
+    ok, out = _run_git(["commit", "-m", message, "--author", "votor <votor@local>"])
+    if not ok:
         if "nothing to commit" in out.lower():
             return {"success": True, "message": "nothing to commit"}
         return {"success": False, "error": out}
@@ -346,6 +475,16 @@ TOOL_DEFINITIONS = [
         }
     },
     {
+        "name": "edit_file_lines",
+        "description": "Edit a file by replacing a range of lines. Use start_line=N, end_line=N-1 to insert without replacing.",
+        "parameters": {
+            "path":        "string — relative path to the file",
+            "start_line":  "string — first line to replace (1-indexed)",
+            "end_line":    "string — last line to replace (1-indexed, inclusive). Set lower than start_line to insert.",
+            "new_content": "string — replacement text"
+        }
+    },
+    {
         "name": "delete_file",
         "description": "Delete a file from the project.",
         "parameters": {
@@ -367,7 +506,8 @@ def dispatch_tool(tool_name: str, params: dict) -> dict:
         return create_file(
             path=params.get("path", ""),
             content=params.get("content", ""),
-            commit_msg=params.get("commit_msg")
+            commit_msg=params.get("commit_msg"),
+            stage_only=params.get("stage_only", "false").lower() == "true",
         )
 
     elif tool_name == "edit_file":
@@ -375,13 +515,23 @@ def dispatch_tool(tool_name: str, params: dict) -> dict:
             path=params.get("path", ""),
             old_str=params.get("old_str", ""),
             new_str=params.get("new_str", ""),
-            commit_msg=params.get("commit_msg")
+            commit_msg=params.get("commit_msg"),
+            stage_only=params.get("stage_only", "false").lower() == "true",
+        )
+
+    elif tool_name == "edit_file_lines":
+        return edit_file_lines(
+            path=params.get("path", ""),
+            start_line=int(params.get("start_line", 1)),
+            end_line=int(params.get("end_line", 1)),
+            new_content=params.get("new_content", ""),
+            stage_only=params.get("stage_only", "false").lower() == "true",
         )
 
     elif tool_name == "delete_file":
         return delete_file(
             path=params.get("path", ""),
-            commit_msg=params.get("commit_msg")
+            stage_only=params.get("stage_only", "false").lower() == "true",
         )
 
     else:

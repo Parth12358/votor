@@ -35,6 +35,7 @@ DIALOG_STYLE = Style.from_dict({
 DEFAULT_CONFIG = {
     "main_provider":    "openai",
     "write_mode":       "edit",
+    "verify_changes":   False,
     "main_model":       "gpt-4o-mini",
     "fallback_model":   "gpt-4o",
     "sub_provider":     "openai",
@@ -208,16 +209,31 @@ def setup_main_agent(config: dict) -> dict:
         else:
             console.print(f"[#00ff9d]✓[/#00ff9d] {env_key} found.")
 
-    models = list_models(provider)
-    model = ask_choice(
-        f"Select model for main agent ({provider}):",
-        models,
-        default=models[0] if models else ""
-    )
+    if provider == "ollama":
+        model = ask_text(
+            f"Enter ollama model name for main agent (e.g. qwen2.5:7b, llama3.1:8b, deepseek-coder:6.7b):",
+            default="qwen2.5:7b"
+        )
+    else:
+        models = list_models(provider)
+        model = ask_choice(
+            f"Select model for main agent ({provider}):",
+            models,
+            default=models[0] if models else ""
+        )
 
     # Fallback model (only for same provider)
     fallback = model
-    if len(models) > 1:
+    if provider == "ollama":
+        want_fallback = ask_yes_no("Set a fallback model for complex queries?", default=True)
+        if want_fallback:
+            fallback = ask_text(
+                "Enter ollama fallback model name (e.g. qwen2.5:14b):",
+                default="qwen2.5:14b"
+            )
+        else:
+            fallback = model
+    elif len(models) > 1:
         want_fallback = ask_yes_no("Set a fallback model for complex queries?", default=True)
         if want_fallback:
             remaining = [m for m in models if m != model]
@@ -262,12 +278,18 @@ def setup_sub_agent(config: dict) -> dict:
                     write_env(env_key, key)
                     os.environ[env_key] = key
 
-    models = list_models(provider)
-    model = ask_choice(
-        f"Select model for sub agent ({provider}):",
-        models,
-        default=models[0] if models else ""
-    )
+    if provider == "ollama":
+        model = ask_text(
+            "Enter ollama model name for sub agent (e.g. qwen2.5:7b, qwen2.5:1.5b):",
+            default="qwen2.5:7b"
+        )
+    else:
+        models = list_models(provider)
+        model = ask_choice(
+            f"Select model for sub agent ({provider}):",
+            models,
+            default=models[0] if models else ""
+        )
 
     config["sub_provider"] = provider
     config["sub_model"]    = model
@@ -295,12 +317,18 @@ def setup_embeddings(config: dict) -> dict:
         default="openai"
     )
 
-    models = list_embedding_models(provider)
-    model = ask_choice(
-        f"Select embedding model ({provider}):",
-        models,
-        default=models[0] if models else ""
-    )
+    if provider == "ollama":
+        model = ask_text(
+            "Enter ollama embedding model name (e.g. nomic-embed-text, mxbai-embed-large):",
+            default="nomic-embed-text"
+        )
+    else:
+        models = list_embedding_models(provider)
+        model = ask_choice(
+            f"Select embedding model ({provider}):",
+            models,
+            default=models[0] if models else ""
+        )
 
     config["embedding_provider"] = provider
     config["embedding_model"]    = model
@@ -414,9 +442,11 @@ def write_prompts():
 
         "sub_system_prompt": "You are a file retrieval agent. You ONLY call read_file.\nYou do NOT answer questions. You do NOT explain anything.\nRead each file in the provided list EXACTLY ONCE then stop immediately.\nDo NOT call read_file on the same file twice under any circumstances.\nIf the files list is empty, do absolutely nothing.\nNEVER invent or guess file paths. ONLY use exact paths from the files list.",
 
-        "write_plan_prompt": "You are votor, a project-aware coding assistant in EDIT MODE.\nYou have been given the full contents of relevant files as tool results in this conversation.\nYour job is to output an exact write plan as JSON.\n\nCRITICAL RULES:\n- Output ONLY a JSON object with a write_plan array — no explanation, no markdown, no preamble\n- For edit steps: old_str must be copied VERBATIM from the file content shown in the tool results — character for character including whitespace and newlines\n- For create steps: content must be the complete file content\n- For delete steps: always set confirm to true\n- NEVER include both an edit/create AND a delete step for the same file in one plan\n- NEVER delete a file that you are also editing or creating\n- Steps must be in dependency order\n- File paths must be RELATIVE paths exactly as shown in the tool results — never use absolute paths\n- If you need to see additional files, output ONLY: {\"need_files\": [\"relative/path\"]}\n- Maximum 3 file request rounds — on the 3rd round output the plan with what you have\n\nWrite plan schema:\n{\n  \"write_plan\": [\n    {\"action\": \"edit\",   \"file\": \"relative/path\", \"old_str\": \"verbatim string from file\", \"new_str\": \"replacement\"},\n    {\"action\": \"create\", \"file\": \"relative/path\", \"content\": \"full file content\"},\n    {\"action\": \"delete\", \"file\": \"relative/path\", \"confirm\": true}\n  ]\n}",
+        "write_plan_prompt": "You are votor, a project-aware coding assistant in EDIT MODE.\nYou have been given the full contents of relevant files as tool results.\nYour job is to output an exact write plan as JSON.\n\nCRITICAL RULES:\n- Output ONLY a JSON object with a write_plan array — no explanation, no markdown, no preamble\n- For edit steps: use start_line and end_line (1-indexed) to specify which lines to replace\n- For insert steps: set end_line lower than start_line to insert before start_line without replacing anything\n- For create steps: content must be the complete file content\n- For delete steps: always set confirm to true\n- NEVER include both an edit/create AND a delete step for the same file\n- Steps must be in dependency order\n- File paths must be RELATIVE paths exactly as shown in the tool results\n- If you need additional files, output ONLY: {\"need_files\": [\"relative/path\"]}\n- Maximum 3 file request rounds\n\nWrite plan schema:\n{\n  \"write_plan\": [\n    {\"action\": \"edit\",   \"file\": \"relative/path\", \"start_line\": 1, \"end_line\": 3, \"new_content\": \"replacement text\"},\n    {\"action\": \"edit\",   \"file\": \"relative/path\", \"start_line\": 5, \"end_line\": 4, \"new_content\": \"inserted before line 5\"},\n    {\"action\": \"create\", \"file\": \"relative/path\", \"content\": \"full file content\"},\n    {\"action\": \"delete\", \"file\": \"relative/path\", \"confirm\": true}\n  ]\n}",
 
-        "write_summary_prompt": "You are votor, a project-aware coding assistant.\nYou have just executed a series of file changes on behalf of the user.\nSummarize what was done clearly and concisely.\n\nRules:\n- List each file that was successfully changed and what changed\n- List any steps that failed and why\n- Mention the git commits that were made\n- Be concise — no need to repeat the full diffs\n- If everything succeeded, end with a positive confirmation\n- If some steps failed, suggest what the user might do to fix them"
+        "write_summary_prompt": "You are votor, a project-aware coding assistant.\nYou have just executed a series of file changes on behalf of the user.\nSummarize what was done clearly and concisely.\n\nRules:\n- List each file that was successfully changed and what changed\n- List any steps that failed and why\n- Mention the git commits that were made\n- Be concise — no need to repeat the full diffs\n- If everything succeeded, end with a positive confirmation\n- If some steps failed, suggest what the user might do to fix them",
+
+        "verify_changes_prompt": "You are votor, a project-aware coding assistant.\nYou have just made file changes on behalf of the user.\nReview the diffs and the full file contents after editing.\n\nYour job:\n- Check if the changes correctly implement what the user asked for\n- Identify any issues: wrong lines changed, missing changes, syntax errors, logic problems\n- Be concise — note what is correct and what is wrong\n- Do NOT suggest a new plan — just report what you see\n\nEnd your response with either:\n  VERIFIED — changes look correct\n  ISSUES FOUND — [brief description of problems]"
     }
 
     with open(prompts_file, "w") as f:
