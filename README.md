@@ -1,4 +1,4 @@
-# Votor
+
 
 Votor is a command-line tool designed for managing and analyzing projects using vector databases.
 
