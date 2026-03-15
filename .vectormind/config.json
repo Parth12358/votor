@@ -1,9 +1,9 @@
 {
-  "main_provider": "openai",
-  "main_model": "gpt-4o-mini",
+  "main_provider": "ollama",
+  "main_model": "qwen2.5:7b",
   "fallback_model": "gpt-4o",
   "sub_provider": "ollama",
-  "sub_model": "qwen2.5:1.5b",
+  "sub_model": "qwen2.5:7b",
   "embedding_provider": "ollama",
   "embedding_model": "nomic-embed-text",
   "top_k": 5,

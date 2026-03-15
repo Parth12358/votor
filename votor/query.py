@@ -15,6 +15,11 @@ console = Console()
 CONFIG_FILE  = Path(".vectormind/config.json")
 PROMPTS_FILE = Path(".vectormind/prompts.json")
 
+# Module-level caches
+_prompts_cache: dict | None = None
+_full_context_tokens_cache: int  = 0
+_full_context_tokens_dirty: bool = True
+
 # Prompts are loaded from .vectormind/prompts.json at query time
 # to prevent prompt strings from being indexed and poisoning retrieval
 
@@ -37,17 +42,28 @@ def load_config() -> dict:
 
 def load_prompts() -> dict:
     """
-    Load prompt strings from .vectormind/prompts.json.
+    Load prompt strings from .vectormind/prompts.json. Cached for session lifetime.
     Falls back to empty strings — surfaces as LLM errors, not silent failures.
     """
+    global _prompts_cache
+    if _prompts_cache is not None:
+        return _prompts_cache
     if PROMPTS_FILE.exists():
         with open(PROMPTS_FILE) as f:
-            return json.load(f)
-    return {
-        "system_prompt":         "",
-        "classification_prompt": "",
-        "sub_system_prompt":     "",
-    }
+            _prompts_cache = json.load(f)
+    else:
+        _prompts_cache = {
+            "system_prompt":         "",
+            "classification_prompt": "",
+            "sub_system_prompt":     "",
+        }
+    return _prompts_cache
+
+
+def invalidate_prompts_cache():
+    """Call after prompts file changes (e.g. /init --force)."""
+    global _prompts_cache
+    _prompts_cache = None
 
 
 # ---------------------------------------------------------------------------
@@ -80,6 +96,25 @@ def estimate_full_context_tokens() -> int:
         return total
     except Exception:
         return 0
+
+
+def get_full_context_tokens() -> int:
+    """
+    Return cached full context token count.
+    Recomputes only when cache is marked dirty (after index/update).
+    Avoids reading and tokenizing all project files on every query.
+    """
+    global _full_context_tokens_cache, _full_context_tokens_dirty
+    if _full_context_tokens_dirty:
+        _full_context_tokens_cache = estimate_full_context_tokens()
+        _full_context_tokens_dirty = False
+    return _full_context_tokens_cache
+
+
+def invalidate_full_context_cache():
+    """Mark cache as dirty. Call after /index or /update."""
+    global _full_context_tokens_dirty
+    _full_context_tokens_dirty = True
 
 
 # ---------------------------------------------------------------------------
@@ -532,6 +567,40 @@ def needs_fallback(answer: str, model: str, fallback: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Streaming helper
+# ---------------------------------------------------------------------------
+
+def _stream_to_console(stream_gen, show_thinking: bool = False) -> dict:
+    """
+    Consume a stream_llm() generator, printing tokens in real time.
+    Clears the streamed output after completion so print_response()
+    can re-render a clean markdown panel.
+    Returns the final result dict (last item yielded by stream_gen).
+    """
+    import sys
+    result       = {}
+    full_content = ""
+    style        = "#5c6370" if show_thinking else "#abb2bf"
+
+    console.print()
+
+    for chunk in stream_gen:
+        if isinstance(chunk, str):
+            full_content += chunk
+            console.print(chunk, end="", style=style, highlight=False)
+        else:
+            result = chunk
+
+    console.print()
+
+    line_count = full_content.count("\n") + 2
+    sys.stdout.write(f"\033[{line_count}A\033[J")
+    sys.stdout.flush()
+
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Main query runner
 # ---------------------------------------------------------------------------
 
@@ -539,15 +608,17 @@ def run_query(
     question: str,
     config: dict = None,
     show_sources: bool = False,
+    show_thinking: bool = False,
     top_k: int = None,
 ) -> dict:
     if config is None:
         config = load_config()
 
-    top_k    = top_k or config.get("top_k", 5)
-    provider = config.get("main_provider", "openai")
-    model    = config.get("main_model", "gpt-4o-mini")
-    fallback = config.get("fallback_model", "gpt-4o")
+    top_k         = top_k or config.get("top_k", 5)
+    provider      = config.get("main_provider", "openai")
+    model         = config.get("main_model", "gpt-4o-mini")
+    fallback      = config.get("fallback_model", "gpt-4o")
+    show_thinking = show_thinking or config.get("show_thinking", False)
 
     main_call_count  = 0
     total_sub_input  = 0
@@ -594,10 +665,14 @@ def run_query(
     )
 
     # Step 4: Sub classifies intent
+    sub_provider = config.get("sub_provider", config.get("main_provider", "openai"))
+    sub_model    = config.get("sub_model", config.get("main_model", "gpt-4o-mini"))
+    console.print(f"  [#5c6370]sub[/#5c6370] [#c678dd]{sub_provider}/{sub_model}[/#c678dd] [#5c6370]→ classify[/#5c6370]")
     t0 = time.time()
     with console.status("[#5c6370]classifying intent...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
         classification = classify_intent(question, config)
     t_classify = round(time.time() - t0, 2)
+    console.print(f"  [#5c6370]sub classified: needs_tools=[/#5c6370][#e5c07b]{classification['needs_tools']}[/#e5c07b] [#5c6370]reason=[/#5c6370][#abb2bf]{classification['reason']}[/#abb2bf]")
     total_sub_input  += classification["input_tokens"]
     total_sub_output += classification["output_tokens"]
 
@@ -607,6 +682,7 @@ def run_query(
     t_sub_tools = 0.0
 
     if classification["needs_tools"]:
+        console.print(f"  [#5c6370]sub[/#5c6370] [#c678dd]{sub_provider}/{sub_model}[/#c678dd] [#5c6370]→ tool loop  files=[/#5c6370][#61afef]{classification['likely_files']}[/#61afef]")
         t0 = time.time()
         with console.status("[#5c6370]sub: reading files...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
             sub_result = run_sub_tool_loop(
@@ -628,16 +704,25 @@ def run_query(
         {"role": "user",   "content": f"## Context\n\n{enriched_context}\n\n## Question\n\n{question}"}
     ]
 
+    console.print(f"  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ call 1/2[/#5c6370]")
     t0 = time.time()
-    with console.status(f"[#5c6370]calling {model}...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
-        main_call_count += 1
-        llm_result = call_llm(provider, model, messages)
+    main_call_count += 1
+    from votor.providers import stream_llm
+    llm_result = _stream_to_console(
+        stream_llm(provider, model, messages, max_tokens=2048),
+        show_thinking=show_thinking,
+    )
     t_llm = round(time.time() - t0, 2)
 
     # Step 7: Failsafe — did main signal it needs a file?
     if main_call_count < 2:
         requested_file = detect_file_request(llm_result["content"])
         if requested_file:
+            # Strip the signal JSON from the content so it never reaches the user
+            llm_result = dict(llm_result)
+            llm_result["content"] = llm_result["content"].replace(
+                f'{{"need_file": "{requested_file}"}}', ""
+            ).strip()
             with console.status("[#5c6370]sub: failsafe read...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
                 failsafe_result = run_sub_tool_loop(
                     config=config,
@@ -657,24 +742,29 @@ def run_query(
                     f"\n\n## Question\n\n{question}"
                 )}
             ]
+            console.print(f"  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ call 2/2 (failsafe)[/#5c6370]")
             t0 = time.time()
-            with console.status(f"[#5c6370]calling {model} (2/2)...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
-                main_call_count += 1  # now at 2 — hard cap reached
-                llm_result = call_llm(provider, model, messages)
+            main_call_count += 1  # now at 2 — hard cap reached
+            llm_result = _stream_to_console(
+                stream_llm(provider, model, messages, max_tokens=2048),
+                show_thinking=show_thinking,
+            )
             t_llm += round(time.time() - t0, 2)
 
     # Step 8: Fallback only after main call 1 — never after call 2
     if main_call_count == 1 and needs_fallback(llm_result["content"], model, fallback):
-        console.print(f"[#5c6370]falling back to {fallback}...[/#5c6370]")
+        console.print(f"  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{fallback}[/#c678dd] [#5c6370]→ fallback call[/#5c6370]")
         t0 = time.time()
-        with console.status(f"[#5c6370]calling {fallback}...[/#5c6370]", spinner="dots", spinner_style="#00ffaa"):
-            llm_result = call_llm(provider, fallback, messages)
+        llm_result = _stream_to_console(
+            stream_llm(provider, fallback, messages, max_tokens=2048),
+            show_thinking=show_thinking,
+        )
         t_llm += round(time.time() - t0, 2)
 
     elapsed = round(time.time() - start_time, 2)
 
     cost         = calculate_cost(model=llm_result["model"], input_tokens=llm_result["input_tokens"], output_tokens=llm_result["output_tokens"])
-    full_tokens  = estimate_full_context_tokens()
+    full_tokens  = get_full_context_tokens()
     tokens_used  = llm_result["input_tokens"]
     tokens_saved = max(0, full_tokens - tokens_used)
     savings_pct  = round((tokens_saved / full_tokens * 100), 1) if full_tokens > 0 else 0

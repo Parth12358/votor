@@ -109,29 +109,46 @@ def validate_model(provider: str, model: str) -> tuple[bool, str]:
 # LLM client factory
 # ---------------------------------------------------------------------------
 
+# Module-level client cache — one client per provider, reused across all calls
+_client_cache: dict[str, object] = {}
+
 def get_llm_client(provider: str):
-    """Return configured LLM client for provider."""
+    """Return configured LLM client for provider. Cached per provider."""
+    if provider in _client_cache:
+        return _client_cache[provider]
+
     if provider == "openai":
         from openai import OpenAI
-        return OpenAI(api_key=get_api_key("openai"))
+        client = OpenAI(api_key=get_api_key("openai"))
 
     elif provider == "anthropic":
         from anthropic import Anthropic
-        return Anthropic(api_key=get_api_key("anthropic"))
+        client = Anthropic(api_key=get_api_key("anthropic"))
 
     elif provider == "groq":
         from groq import Groq
-        return Groq(api_key=get_api_key("groq"))
+        client = Groq(api_key=get_api_key("groq"))
 
     elif provider == "ollama":
-        from openai import OpenAI  # Ollama has OpenAI-compatible API
-        return OpenAI(
+        from openai import OpenAI
+        client = OpenAI(
             base_url="http://localhost:11434/v1",
-            api_key="ollama"  # required but ignored by Ollama
+            api_key="ollama"
         )
 
     else:
         raise ValueError(f"Unknown provider: {provider}")
+
+    _client_cache[provider] = client
+    return client
+
+
+def clear_client_cache():
+    """
+    Clear cached clients. Call this if provider config changes at runtime
+    e.g. after /init --force or /provider command.
+    """
+    _client_cache.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +210,95 @@ def call_llm(
         }
 
 
+def stream_llm(
+    provider: str,
+    model: str,
+    messages: list[dict],
+    temperature: float = 0.2,
+    max_tokens: int = 2048,
+):
+    """
+    Streaming version of call_llm.
+    Yields string tokens as they arrive.
+    When stream is exhausted, yields a final dict with full content and token counts.
+
+    Usage:
+        for chunk in stream_llm(provider, model, messages):
+            if isinstance(chunk, str):
+                print(chunk, end="", flush=True)
+            else:
+                result = chunk  # final dict
+    """
+    client = get_llm_client(provider)
+
+    if provider == "anthropic":
+        system_msg    = ""
+        user_messages = []
+        for m in messages:
+            if m["role"] == "system":
+                system_msg = m["content"]
+            else:
+                user_messages.append(m)
+
+        full_content  = ""
+        input_tokens  = 0
+        output_tokens = 0
+
+        with client.messages.stream(
+            model=model,
+            max_tokens=max_tokens,
+            system=system_msg,
+            messages=user_messages,
+            temperature=temperature,
+        ) as stream:
+            for text in stream.text_stream:
+                full_content += text
+                yield text
+            final         = stream.get_final_message()
+            input_tokens  = final.usage.input_tokens
+            output_tokens = final.usage.output_tokens
+
+        yield {
+            "content":       full_content,
+            "input_tokens":  input_tokens,
+            "output_tokens": output_tokens,
+            "model":         model,
+            "provider":      provider,
+        }
+
+    else:
+        # OpenAI-compatible: OpenAI, Groq, Ollama
+        full_content  = ""
+        input_tokens  = 0
+        output_tokens = 0
+
+        response = client.chat.completions.create(
+            model=model,
+            messages=messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        for chunk in response:
+            if chunk.choices and chunk.choices[0].delta.content:
+                text = chunk.choices[0].delta.content
+                full_content += text
+                yield text
+            if chunk.usage:
+                input_tokens  = chunk.usage.prompt_tokens
+                output_tokens = chunk.usage.completion_tokens
+
+        yield {
+            "content":       full_content,
+            "input_tokens":  input_tokens,
+            "output_tokens": output_tokens,
+            "model":         model,
+            "provider":      provider,
+        }
+
+
 # ---------------------------------------------------------------------------
 # Embedding client factory
 # ---------------------------------------------------------------------------
@@ -229,8 +335,7 @@ def embed_texts(
     model    = config.get("embedding_model", "text-embedding-3-small")
 
     if provider in ("openai", "groq"):
-        from openai import OpenAI
-        client = OpenAI(api_key=get_api_key("openai"))
+        client = get_llm_client("openai")
 
         # Batch in groups of 100
         all_embeddings = []
@@ -241,15 +346,12 @@ def embed_texts(
         return all_embeddings
 
     elif provider == "ollama":
-        from openai import OpenAI
-        client = OpenAI(
-            base_url="http://localhost:11434/v1",
-            api_key="ollama"
-        )
+        client = get_llm_client("ollama")
         all_embeddings = []
-        for text in texts:
-            response = client.embeddings.create(input=[text], model=model)
-            all_embeddings.append(response.data[0].embedding)
+        for i in range(0, len(texts), 10):
+            batch = texts[i:i + 10]
+            response = client.embeddings.create(input=batch, model=model)
+            all_embeddings.extend([e.embedding for e in response.data])
         return all_embeddings
 
     else:

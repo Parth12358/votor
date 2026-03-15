@@ -54,6 +54,7 @@ COMMANDS = [
     ("/config",    "Show current configuration"),
     ("/provider",  "Switch AI provider or model"),
     ("/sources",   "Toggle showing retrieved sources"),
+    ("/thinking",  "Toggle showing raw model token stream"),
     ("/clear",     "Clear the screen"),
     ("/help",      "Show help"),
     ("/exit",      "Exit votor"),
@@ -100,6 +101,7 @@ HELP_TEXT = """
   [#00ffaa]/config[/#00ffaa]            [#abb2bf]Show current configuration[/#abb2bf]
   [#00ffaa]/provider[/#00ffaa]          [#abb2bf]Switch AI provider or model[/#abb2bf]
   [#00ffaa]/sources[/#00ffaa]           [#abb2bf]Toggle showing retrieved sources[/#abb2bf]
+  [#00ffaa]/thinking[/#00ffaa]          [#abb2bf]Toggle showing raw model token stream[/#abb2bf]
   [#00ffaa]/clear[/#00ffaa]             [#abb2bf]Clear the screen[/#abb2bf]
   [#00ffaa]/help[/#00ffaa]              [#abb2bf]Show this help[/#abb2bf]
   [#00ffaa]/exit[/#00ffaa]              [#abb2bf]Exit votor[/#abb2bf]
@@ -229,7 +231,11 @@ def handle_init(force: bool = False):
     console.print()
     try:
         from votor.init_flow import run_init
+        from votor.providers import clear_client_cache
+        from votor.query import invalidate_prompts_cache
         result = run_init(force=force)
+        clear_client_cache()
+        invalidate_prompts_cache()
         if isinstance(result, tuple):
             config, do_index = result
         else:
@@ -246,7 +252,9 @@ def handle_index(full: bool = True, config: dict = None):
     console.print(f"[#5c6370]Running {label}...[/#5c6370]\n")
     try:
         from votor.indexer import index_project
+        from votor.query import invalidate_full_context_cache
         stats = index_project(incremental=not full, force=full, config=config)
+        invalidate_full_context_cache()
         console.print(
             f"[#00ffaa]✓[/#00ffaa] Indexed [#abb2bf]{stats['files']}[/#abb2bf] files, "
             f"[#abb2bf]{stats['chunks']}[/#abb2bf] chunks"
@@ -361,13 +369,13 @@ def handle_dashboard():
     console.print("[#00ffaa]✓[/#00ffaa] Dashboard at [link=http://localhost:8000]http://localhost:8000[/link]\n")
 
 
-def handle_query(question: str, show_sources: bool):
+def handle_query(question: str, show_sources: bool, show_thinking: bool = False):
     if not VOTOR_DIR.exists():
         console.print("[#e06c75]Not initialized. Run /init first.[/#e06c75]\n")
         return
     try:
         from votor.query import run_query
-        result = run_query(question, show_sources=show_sources)
+        result = run_query(question, show_sources=show_sources, show_thinking=show_thinking)
         if result.get("error") == "no_context":
             console.print(f"[#e06c75]{result['answer']}[/#e06c75]\n")
             return
@@ -409,6 +417,7 @@ def main():
     )
 
     show_sources  = False
+    show_thinking = False
     _ctrl_c_count = 0
 
     while True:
@@ -469,13 +478,17 @@ def main():
                 show_sources = not show_sources
                 state = "on" if show_sources else "off"
                 console.print(f"  [#5c6370]sources[/#5c6370] [#abb2bf]{state}[/#abb2bf]\n")
+            elif cmd == "/thinking":
+                show_thinking = not show_thinking
+                state = "on" if show_thinking else "off"
+                console.print(f"  [#5c6370]thinking[/#5c6370] [#abb2bf]{state}[/#abb2bf]\n")
             elif cmd == "/clear":
                 console.clear()
                 print_banner()
             else:
                 console.print(f"  [#e06c75]unknown: {cmd}[/#e06c75] [#5c6370]— type [#00ffaa]/help[/#00ffaa][/#5c6370]\n")
         else:
-            handle_query(inp, show_sources)
+            handle_query(inp, show_sources, show_thinking)
 
 
 if __name__ == "__main__":

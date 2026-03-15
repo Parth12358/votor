@@ -39,5 +39,5 @@ where = ["."]
 include = ["votor*"]
 
 [project.urls]
-Homepage = "https://github.com/yourusername/votor"
-Issues = "https://github.com/yourusername/votor/issues"
+Homepage = "https://github.com/Parth12358/votor"
+Issues = "https://github.com/Parth12358/votor/issues"
