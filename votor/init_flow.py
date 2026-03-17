@@ -4,12 +4,6 @@ import subprocess
 from pathlib import Path
 
 from rich.console import Console
-from rich.panel import Panel
-from rich.table import Table
-from rich import box
-from prompt_toolkit import prompt
-from prompt_toolkit.shortcuts import radiolist_dialog, checkboxlist_dialog
-from prompt_toolkit.styles import Style
 
 from votor.providers import (
     list_providers, list_models, list_embedding_models,
@@ -19,18 +13,10 @@ from votor.providers import (
 console = Console()
 
 VOTOR_DIR   = Path(".vectormind")
+
 CONFIG_FILE = VOTOR_DIR / "config.json"
 ENV_FILE    = Path(".env")
 
-DIALOG_STYLE = Style.from_dict({
-    "dialog":             "bg:#0a0a0f",
-    "dialog.body":        "bg:#0a0a0f fg:#e2e2f0",
-    "dialog.border":      "fg:#1e1e2e",
-    "button":             "bg:#1e1e2e fg:#e2e2f0",
-    "button.focused":     "bg:#00ff9d fg:#0a0a0f bold",
-    "radio-list":         "bg:#0a0a0f fg:#e2e2f0",
-    "radio-list focused": "fg:#00ff9d bold",
-})
 
 DEFAULT_CONFIG = {
     "main_provider":    "openai",
@@ -63,23 +49,117 @@ DEFAULT_CONFIG = {
 
 
 # ---------------------------------------------------------------------------
+# Step UI helpers
+# ---------------------------------------------------------------------------
+
+def _step_header(title: str, description: str):
+    """Print a clean step header with title and description."""
+    console.print()
+    console.rule(style="#1e1e2e")
+    console.print(f"  [#5c6370]{title}[/#5c6370]")
+    console.print(f"  [#abb2bf]{description}[/#abb2bf]")
+    console.print()
+
+
+def _key_hints():
+    """Print key guide below every interactive prompt."""
+    console.print(
+        f"\n  [#5c6370]e[/#5c6370] [#abb2bf]edit[/#abb2bf]   "
+        f"[#5c6370]s[/#5c6370] [#abb2bf]skip[/#abb2bf]   "
+        f"[#5c6370]?[/#5c6370] [#abb2bf]explain[/#abb2bf]   "
+        f"[#5c6370]q[/#5c6370] [#abb2bf]quit[/#abb2bf]"
+    )
+
+
+def _step_confirm(label: str, value: str, color: str = "#61afef"):
+    """Print confirmation line after a step completes."""
+    console.print(f"\n  [#00ffaa]✓[/#00ffaa]  [#5c6370]{label}[/#5c6370] [{color}]{value}[/{color}]")
+
+
+STEP_EXPLANATIONS = {
+    "main_agent": (
+        "The main agent answers your coding questions and plans file changes.\n"
+        "  Use a strong API model (claude-haiku, gpt-4o-mini) for best results.\n"
+        "  Local models (ollama) work but give lower quality answers."
+    ),
+    "sub_agent": (
+        "The sub agent classifies your intent and reads files — it never reasons.\n"
+        "  A small fast local model (qwen2.5:7b) is ideal here.\n"
+        "  Sub runs free locally — it never touches the paid API."
+    ),
+    "embeddings": (
+        "Embeddings convert your code into vectors for semantic search.\n"
+        "  nomic-embed-text (ollama) is free and works well.\n"
+        "  Must match the model used at index time — changing this requires /index --force."
+    ),
+    "git": (
+        "Votor commits every AI file change to git with a votor: prefix.\n"
+        "  This gives you full history, undo, and revert for all AI changes.\n"
+        "  Git is required for edit mode to work."
+    ),
+    "index": (
+        "Chunk size controls how files are split for indexing.\n"
+        "  Smaller chunks = more precise retrieval but more vectors.\n"
+        "  top_k controls how many chunks are retrieved per query."
+    ),
+}
+
+
+def _explain(step_key: str):
+    """Print explanation for a step."""
+    text = STEP_EXPLANATIONS.get(step_key, "No explanation available for this step.")
+    console.print()
+    console.print(f"  [#e5c07b]?[/#e5c07b]  [#abb2bf]{text}[/#abb2bf]")
+    console.print()
+
+
+def _check_quit(result):
+    """If result is None (user cancelled), ask to confirm quit."""
+    if result is None:
+        console.print(f"\n  [#e06c75]q[/#e06c75]  [#abb2bf]Quit setup? All progress will be lost.[/#abb2bf]")
+        confirm = ask_yes_no("Quit setup?", default=False)
+        if confirm:
+            console.print(f"\n  [#5c6370]Setup cancelled.[/#5c6370]\n")
+            raise SystemExit(0)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
+def ask_provider(prompt_text: str, default: str = "openai") -> str:
+    """Show available providers as a hint then accept free-text input."""
+    providers = list_providers()
+    hint = " / ".join(f"[#c678dd]{p}[/#c678dd]" for p in providers)
+    console.print(f"\n  [#5c6370]{prompt_text}[/#5c6370]")
+    console.print(f"  [#5c6370]options:[/#5c6370] {hint}")
+
+    while True:
+        from prompt_toolkit import prompt as pt_prompt
+        raw = pt_prompt(f"  [{default}]: ").strip().lower()
+        value = raw if raw else default
+
+        if value in providers:
+            return value
+
+        console.print(f"  [#e06c75]✗[/#e06c75]  [#abb2bf]Unknown provider. Choose from: {', '.join(providers)}[/#abb2bf]")
+
+
 def ask_choice(prompt_text: str, choices: list[str], default: str = None) -> str:
-    """Arrow-key navigable radio list using prompt_toolkit."""
+    """Plain keyboard input with options shown as hint."""
+    from prompt_toolkit import prompt as pt_prompt
     default = default or choices[0]
-    values  = [(c, c) for c in choices]
+    hint = " / ".join(choices)
+    console.print(f"\n  [#5c6370]{prompt_text}[/#5c6370]")
+    console.print(f"  [#5c6370]options:[/#5c6370] [#abb2bf]{hint}[/#abb2bf]")
 
-    result = radiolist_dialog(
-        title=prompt_text,
-        text="Use arrow keys to select, Enter to confirm:",
-        values=values,
-        default=default,
-        style=DIALOG_STYLE,
-    ).run()
-
-    return result if result is not None else default
+    while True:
+        raw = pt_prompt(f"  [{default}]: ").strip()
+        value = raw if raw else default
+        if value in choices:
+            return value
+        console.print(f"  [#e06c75]✗[/#e06c75]  [#abb2bf]Invalid choice. Options: {', '.join(choices)}[/#abb2bf]")
 
 
 def ask_text(prompt_text: str, default: str = "") -> str:
@@ -91,21 +171,13 @@ def ask_text(prompt_text: str, default: str = "") -> str:
 
 
 def ask_yes_no(prompt_text: str, default: bool = True) -> bool:
-    """Yes/no using arrow-key radio list."""
-    choices = [("yes", "Yes"), ("no", "No")]
-    default_val = "yes" if default else "no"
-
-    result = radiolist_dialog(
-        title=prompt_text,
-        text="Use arrow keys to select, Enter to confirm:",
-        values=choices,
-        default=default_val,
-        style=DIALOG_STYLE,
-    ).run()
-
-    if result is None:
+    """Plain y/n keyboard input."""
+    from prompt_toolkit import prompt as pt_prompt
+    default_str = "Y/n" if default else "y/N"
+    console.print(f"\n  [#5c6370]{prompt_text}[/#5c6370]")
+    raw = pt_prompt(f"  [{default_str}]: ").strip().lower()
+    if not raw:
         return default
-    return result == "yes"
     return raw in ("y", "yes")
 
 
@@ -181,17 +253,16 @@ def set_git_remote(url: str):
 # Setup sections
 # ---------------------------------------------------------------------------
 
-def setup_main_agent(config: dict) -> dict:
+def setup_main_agent(config: dict, redo: bool = False) -> dict:
     """Configure main LLM provider and model."""
-    console.print(Panel(
-        "[dim]The main agent answers your coding questions.[/dim]",
-        title="[#00ff9d]Main Agent[/#00ff9d]",
-        border_style="#1e1e2e"
-    ))
+    _step_header(
+        "main agent",
+        "Answers your questions and plans file changes. Use a strong model here."
+    )
+    _key_hints()
 
-    provider = ask_choice(
-        "Select provider for main agent:",
-        list_providers(),
+    provider = ask_provider(
+        "Provider for main agent:",
         default=config.get("main_provider", "openai")
     )
 
@@ -200,74 +271,75 @@ def setup_main_agent(config: dict) -> dict:
         env_key = PROVIDERS[provider]["env_key"]
         existing = os.getenv(env_key, "")
         if not existing:
-            console.print(f"\n[dim]No {env_key} found.[/dim]")
+            console.print(f"\n  [#e5c07b]![/#e5c07b]  [#abb2bf]No {env_key} found in .env[/#abb2bf]")
             key = ask_text(f"Enter your {provider} API key:", default="")
             if key:
                 write_env(env_key, key)
                 os.environ[env_key] = key
-                console.print(f"[#00ff9d]✓[/#00ff9d] Saved to .env")
+                console.print(f"  [#00ffaa]✓[/#00ffaa]  [#5c6370]Saved to .env[/#5c6370]")
         else:
-            console.print(f"[#00ff9d]✓[/#00ff9d] {env_key} found.")
+            console.print(f"  [#00ffaa]✓[/#00ffaa]  [#5c6370]{env_key} found[/#5c6370]")
 
     if provider == "ollama":
         model = ask_text(
-            f"Enter ollama model name for main agent (e.g. qwen2.5:7b, llama3.1:8b, deepseek-coder:6.7b):",
-            default="qwen2.5:7b"
+            "Ollama model name for main agent (e.g. qwen2.5:14b, llama3.1:8b):",
+            default="qwen2.5:14b"
         )
     else:
         models = list_models(provider)
         model = ask_choice(
-            f"Select model for main agent ({provider}):",
+            f"Model for main agent ({provider}):",
             models,
             default=models[0] if models else ""
         )
+        _check_quit(model)
 
-    # Fallback model (only for same provider)
+    # Fallback
     fallback = model
     if provider == "ollama":
-        want_fallback = ask_yes_no("Set a fallback model for complex queries?", default=True)
+        want_fallback = ask_yes_no("Set a fallback model?", default=True)
         if want_fallback:
             fallback = ask_text(
-                "Enter ollama fallback model name (e.g. qwen2.5:14b):",
+                "Fallback model name (e.g. qwen2.5:14b):",
                 default="qwen2.5:14b"
             )
-        else:
-            fallback = model
-    elif len(models) > 1:
+    elif len(list_models(provider)) > 1:
         want_fallback = ask_yes_no("Set a fallback model for complex queries?", default=True)
         if want_fallback:
-            remaining = [m for m in models if m != model]
-            fallback = ask_choice("Select fallback model:", remaining, default=remaining[0])
+            remaining = [m for m in list_models(provider) if m != model]
+            fallback = ask_choice("Fallback model:", remaining, default=remaining[0])
+            _check_quit(fallback)
 
-    config["main_provider"] = provider
-    config["main_model"]    = model
+    config["main_provider"]  = provider
+    config["main_model"]     = model
     config["fallback_model"] = fallback
 
-    console.print(f"\n[#00ff9d]✓[/#00ff9d] Main agent: [white]{provider}[/white] / [white]{model}[/white]")
+    _step_confirm("main agent", f"{provider} / {model}", color="#c678dd")
+    if fallback != model:
+        _step_confirm("fallback", fallback, color="#5c6370")
+
     return config
 
 
 def setup_sub_agent(config: dict) -> dict:
     """Configure sub-agent provider and model."""
-    console.print(Panel(
-        "[dim]The sub-agent handles indexing, verification, and lightweight tasks.\n"
-        "A smaller, faster model is recommended.[/dim]",
-        title="[#00ff9d]Sub Agent[/#00ff9d]",
-        border_style="#1e1e2e"
-    ))
+    _step_header(
+        "sub agent",
+        "Classifies intent and reads files. Local small model recommended — runs free."
+    )
+    _key_hints()
 
     same = ask_yes_no(
-        f"Use same provider as main agent ({config['main_provider']})?",
-        default=True
+        f"Use same provider as main ({config['main_provider']})?",
+        default=config["main_provider"] == "ollama"
     )
 
     if same:
         provider = config["main_provider"]
     else:
-        provider = ask_choice(
-            "Select provider for sub agent:",
-            list_providers(),
-            default=config.get("sub_provider", "openai")
+        provider = ask_provider(
+            "Provider for sub agent:",
+            default=config.get("sub_provider", "ollama")
         )
         if provider_needs_key(provider) and provider != config["main_provider"]:
             env_key = PROVIDERS[provider]["env_key"]
@@ -280,129 +352,126 @@ def setup_sub_agent(config: dict) -> dict:
 
     if provider == "ollama":
         model = ask_text(
-            "Enter ollama model name for sub agent (e.g. qwen2.5:7b, qwen2.5:1.5b):",
+            "Ollama model name for sub agent (e.g. qwen2.5:7b, qwen2.5:1.5b):",
             default="qwen2.5:7b"
         )
     else:
         models = list_models(provider)
         model = ask_choice(
-            f"Select model for sub agent ({provider}):",
+            f"Model for sub agent ({provider}):",
             models,
             default=models[0] if models else ""
         )
+        _check_quit(model)
 
     config["sub_provider"] = provider
     config["sub_model"]    = model
 
-    console.print(f"\n[#00ff9d]✓[/#00ff9d] Sub agent: [white]{provider}[/white] / [white]{model}[/white]")
+    _step_confirm("sub agent", f"{provider} / {model}", color="#c678dd")
     return config
 
 
 def setup_embeddings(config: dict) -> dict:
     """Configure embedding model."""
-    console.print(Panel(
-        "[dim]Embeddings convert your code into vectors for search.\n"
-        "Anthropic and Groq use OpenAI embeddings by default.[/dim]",
-        title="[#00ff9d]Embeddings[/#00ff9d]",
-        border_style="#1e1e2e"
-    ))
+    _step_header(
+        "embeddings",
+        "Converts code into vectors for search. Must stay consistent — changing requires re-index."
+    )
+    _key_hints()
 
-    # Determine available embedding providers
-    embed_providers = [p for p in list_providers()
-                       if list_embedding_models(p)]
-
-    provider = ask_choice(
-        "Select embedding provider:",
-        embed_providers,
-        default="openai"
+    provider = ask_provider(
+        "Embedding provider:",
+        default=config.get("embedding_provider", "ollama")
     )
 
     if provider == "ollama":
         model = ask_text(
-            "Enter ollama embedding model name (e.g. nomic-embed-text, mxbai-embed-large):",
+            "Ollama embedding model (e.g. nomic-embed-text, mxbai-embed-large):",
             default="nomic-embed-text"
         )
     else:
         models = list_embedding_models(provider)
         model = ask_choice(
-            f"Select embedding model ({provider}):",
+            f"Embedding model ({provider}):",
             models,
             default=models[0] if models else ""
         )
+        _check_quit(model)
 
     config["embedding_provider"] = provider
     config["embedding_model"]    = model
 
-    console.print(f"\n[#00ff9d]✓[/#00ff9d] Embeddings: [white]{provider}[/white] / [white]{model}[/white]")
+    _step_confirm("embeddings", f"{provider} / {model}", color="#c678dd")
     return config
 
 
 def setup_git(config: dict) -> dict:
     """Configure git and optional remote."""
-    console.print(Panel(
-        "[dim]Votor commits every AI file change to git with a 'votor:' prefix.\n"
-        "This gives you full undo/revert history.[/dim]",
-        title="[#00ff9d]Git Setup[/#00ff9d]",
-        border_style="#1e1e2e"
-    ))
+    _step_header(
+        "git",
+        "Every AI change is committed with a votor: prefix. Required for edit mode."
+    )
+    _key_hints()
 
     if not check_git():
-        init = ask_yes_no("No git repo found. Initialize one?", default=True)
+        console.print(f"  [#e5c07b]![/#e5c07b]  [#abb2bf]No git repository found in this directory.[/#abb2bf]")
+        init = ask_yes_no("Initialize a git repository?", default=True)
         if init:
             init_git()
         else:
-            console.print("[dim]Skipping git setup. AI changes won't be tracked.[/dim]")
+            console.print(f"  [#5c6370]Skipping git. AI changes won't be tracked.[/#5c6370]")
             config["git_remote"] = "none"
             return config
 
     remote = ask_choice(
-        "Set up remote sync for AI changes?",
+        "Set up a git remote?",
         ["none", "github", "gitlab"],
         default="none"
     )
-
+    _check_quit(remote)
     config["git_remote"] = remote
 
     if remote in ("github", "gitlab"):
-        url = ask_text(f"Enter your {remote} repository URL:")
+        url = ask_text(f"{remote} repository URL:")
         if url:
             config["git_remote_url"] = url
             set_git_remote(url)
-
-            # Optional token for HTTPS push
             want_token = ask_yes_no("Store a personal access token for pushing?", default=False)
             if want_token:
-                token = ask_text("Enter token (stored in .env):")
+                token = ask_text("Personal access token (stored in .env):")
                 if token:
                     write_env("VOTOR_GIT_TOKEN", token)
 
-    console.print(f"\n[#00ff9d]✓[/#00ff9d] Git remote: [white]{remote}[/white]")
+    _step_confirm("git remote", remote)
     return config
 
 
 def setup_index_options(config: dict) -> dict:
     """Configure chunk size and top_k."""
-    console.print(Panel(
-        "[dim]These settings control how your project is indexed and retrieved.[/dim]",
-        title="[#00ff9d]Index Settings[/#00ff9d]",
-        border_style="#1e1e2e"
-    ))
+    _step_header(
+        "index settings",
+        "Controls how files are chunked and how many chunks are retrieved per query."
+    )
+    _key_hints()
 
     chunk = ask_choice(
-        "Chunk size (lines per chunk):",
+        "Chunk size (words per chunk):",
         ["100", "200", "300", "500"],
         default="200"
     )
+    _check_quit(chunk)
     config["chunk_size"] = int(chunk)
 
     top_k = ask_choice(
-        "How many chunks to retrieve per query (top_k):",
+        "Chunks retrieved per query (top_k):",
         ["3", "5", "8", "10"],
         default="5"
     )
+    _check_quit(top_k)
     config["top_k"] = int(top_k)
 
-    console.print(f"\n[#00ff9d]✓[/#00ff9d] Chunk size: [white]{chunk}[/white] | Top K: [white]{top_k}[/white]")
+    _step_confirm("chunk size", chunk)
+    _step_confirm("top k", top_k)
     return config
 
 
@@ -412,19 +481,17 @@ def setup_index_options(config: dict) -> dict:
 
 def print_summary(config: dict):
     """Print final config summary before writing."""
-    table = Table(show_header=False, box=box.SIMPLE, show_edge=False, padding=(0, 2))
-    table.add_column(style="dim")
-    table.add_column(style="#00ff9d")
-
-    table.add_row("main agent",    f"{config['main_provider']} / {config['main_model']}")
-    table.add_row("fallback",      config["fallback_model"])
-    table.add_row("sub agent",     f"{config['sub_provider']} / {config['sub_model']}")
-    table.add_row("embeddings",    f"{config['embedding_provider']} / {config['embedding_model']}")
-    table.add_row("top k",         str(config["top_k"]))
-    table.add_row("chunk size",    str(config["chunk_size"]))
-    table.add_row("git remote",    config["git_remote"])
-
-    console.print(Panel(table, title="[dim]configuration summary[/dim]", border_style="#1e1e2e"))
+    console.print()
+    console.rule(style="#1e1e2e")
+    console.print(f"  [#5c6370]summary[/#5c6370]\n")
+    console.print(f"  [#5c6370]main[/#5c6370]       [#c678dd]{config['main_provider']}[/#c678dd] [#abb2bf]/[/#abb2bf] [#61afef]{config['main_model']}[/#61afef]")
+    console.print(f"  [#5c6370]fallback[/#5c6370]   [#61afef]{config['fallback_model']}[/#61afef]")
+    console.print(f"  [#5c6370]sub[/#5c6370]        [#c678dd]{config['sub_provider']}[/#c678dd] [#abb2bf]/[/#abb2bf] [#61afef]{config['sub_model']}[/#61afef]")
+    console.print(f"  [#5c6370]embed[/#5c6370]      [#c678dd]{config['embedding_provider']}[/#c678dd] [#abb2bf]/[/#abb2bf] [#61afef]{config['embedding_model']}[/#61afef]")
+    console.print(f"  [#5c6370]top k[/#5c6370]      [#abb2bf]{config['top_k']}[/#abb2bf]")
+    console.print(f"  [#5c6370]chunk[/#5c6370]      [#abb2bf]{config['chunk_size']}[/#abb2bf]")
+    console.print(f"  [#5c6370]git[/#5c6370]        [#abb2bf]{config['git_remote']}[/#abb2bf]")
+    console.print()
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +519,7 @@ def write_prompts():
     with open(prompts_file, "w") as f:
         json.dump(prompts, f, indent=2)
 
-    console.print(f"[#00ff9d]✓[/#00ff9d] Prompts saved to [white].vectormind/prompts.json[/white]")
+    # (confirmation printed by run_init after write_prompts() returns)
 
 
 # ---------------------------------------------------------------------------
@@ -466,24 +533,26 @@ def run_init(force: bool = False) -> dict:
     Returns final config dict.
     """
     # Check if already initialized
-    if VOTOR_DIR.exists() and not force:
-        console.print(Panel(
-            "[dim]Votor is already initialized in this project.\n"
-            "Run with force=True or use [white]/init[/white] again to reconfigure.[/dim]",
-            border_style="#1e1e2e"
-        ))
-        if CONFIG_FILE.exists():
-            with open(CONFIG_FILE) as f:
-                return json.load(f)
-        return DEFAULT_CONFIG
+    if VOTOR_DIR.exists() and CONFIG_FILE.exists() and not force:
+        with open(CONFIG_FILE) as f:
+            existing = json.load(f)
 
-    console.print(Panel(
-        "[bold #00ff9d]Welcome to votor setup[/bold #00ff9d]\n\n"
-        "[dim]This wizard will configure your AI provider, models, embeddings,\n"
-        "and git settings for this project.[/dim]",
-        border_style="#00ff9d",
-        padding=(1, 2)
-    ))
+        console.print()
+        console.print(f"  [#00ffaa]votor[/#00ffaa] [#5c6370]already configured in this project[/#5c6370]")
+        console.print(f"  [#5c6370]run [#00ffaa]/init --force[/#00ffaa] to reconfigure[/#5c6370]")
+        console.print()
+        print_summary(existing)
+        return existing
+
+    console.print()
+    console.print(f"  [bold #00ffaa]votor[/bold #00ffaa] [#5c6370]setup wizard[/#5c6370]")
+    console.print(f"  [#5c6370]Configure your AI providers, models, and index settings.[/#5c6370]")
+    console.print(f"  [#5c6370]At each step:[/#5c6370] "
+                  f"[#5c6370]e[/#5c6370] [#abb2bf]edit[/#abb2bf]  "
+                  f"[#5c6370]s[/#5c6370] [#abb2bf]skip[/#abb2bf]  "
+                  f"[#5c6370]?[/#5c6370] [#abb2bf]explain[/#abb2bf]  "
+                  f"[#5c6370]q[/#5c6370] [#abb2bf]quit[/#abb2bf]")
+    console.print()
 
     # Create directories
     VOTOR_DIR.mkdir(exist_ok=True)
@@ -495,11 +564,11 @@ def run_init(force: bool = False) -> dict:
     # Ensure .env exists
     if not ENV_FILE.exists():
         ENV_FILE.touch()
-        console.print("[#00ff9d]✓[/#00ff9d] Created .env")
+        console.print(f"  [#00ffaa]✓[/#00ffaa]  [#5c6370]created[/#5c6370]  [#61afef].env[/#61afef]")
 
     # Ensure .gitignore
     ensure_gitignore()
-    console.print("[#00ff9d]✓[/#00ff9d] Updated .gitignore\n")
+    console.print(f"  [#00ffaa]✓[/#00ffaa]  [#5c6370]updated[/#5c6370]  [#61afef].gitignore[/#61afef]")
 
     # Run setup sections
     config = setup_main_agent(config)
@@ -515,18 +584,22 @@ def run_init(force: bool = False) -> dict:
     # Confirm
     confirmed = ask_yes_no("Save this configuration?", default=True)
     if not confirmed:
-        console.print("[dim]Setup cancelled.[/dim]")
+        console.print(f"\n  [#5c6370]Setup cancelled.[/#5c6370]")
         return config
 
     # Write config
     with open(CONFIG_FILE, "w") as f:
         json.dump(config, f, indent=2)
 
-    console.print(f"\n[#00ff9d]✓[/#00ff9d] Config saved to [white].vectormind/config.json[/white]")
+    console.print(f"\n  [#00ffaa]✓[/#00ffaa]  [#5c6370]config saved[/#5c6370]  [#61afef].vectormind/config.json[/#61afef]")
 
     write_prompts()
+    console.print(f"  [#00ffaa]✓[/#00ffaa]  [#5c6370]prompts saved[/#5c6370]  [#61afef].vectormind/prompts.json[/#61afef]")
+    console.print()
+    console.print(f"  [#5c6370]next →[/#5c6370] [#abb2bf]index your project so votor can answer questions about it[/#abb2bf]")
+    console.print()
 
     # Ask about full index
-    do_index = ask_yes_no("\nRun full project index now?", default=True)
+    do_index = ask_yes_no("Run full index now?", default=True)
 
     return config, do_index

@@ -945,30 +945,39 @@ def needs_fallback(answer: str, model: str, fallback: str) -> bool:
 
 def _stream_to_console(stream_gen, show_thinking: bool = False) -> dict:
     """
-    Consume a stream_llm() generator, printing tokens in real time.
-    Clears the streamed output after completion so print_response()
-    can re-render a clean markdown panel.
-    Returns the final result dict (last item yielded by stream_gen).
+    Stream tokens to console in real time.
+    After stream completes, clears the streamed output using Rich's
+    own line tracking so print_response() can render a clean panel.
+    Works correctly on Windows with ConPTY.
     """
-    import sys
-    result       = {}
-    full_content = ""
-    style        = "#5c6370" if show_thinking else "#abb2bf"
+    from rich.control import Control
 
-    console.print()
+    result        = {}
+    full_content  = ""
+    style         = "#5c6370" if show_thinking else "#abb2bf"
+    lines_printed = 0
+
+    console.print()   # newline before streaming
+    lines_printed += 1
 
     for chunk in stream_gen:
         if isinstance(chunk, str):
-            full_content += chunk
+            full_content  += chunk
+            lines_printed += chunk.count("\n")
             console.print(chunk, end="", style=style, highlight=False)
         else:
             result = chunk
 
-    console.print()
+    console.print()   # newline after streaming
+    lines_printed += 1
 
-    line_count = full_content.count("\n") + 2
-    sys.stdout.write(f"\033[{line_count}A\033[J")
-    sys.stdout.flush()
+    # Clear all streamed lines via Rich Control (works on Windows ConPTY)
+    if lines_printed > 0:
+        console.control(Control.move_to_column(0))
+        for _ in range(lines_printed):
+            console.control(Control.move(0, -1))
+        console.file.write("\033[J")
+        console.file.flush()
 
     return result
 

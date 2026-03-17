@@ -127,7 +127,7 @@ def print_response(result: dict, show_sources: bool):
     console.print(Panel(
         Markdown(result["answer"]),
         title=f"[bold #00ffaa]votor[/bold #00ffaa] [#5c6370]({result['provider']}/{result['model']})[/#5c6370]",
-        border_style="#3e4451",
+        border_style="#1e1e2e",
         padding=(1, 2)
     ))
 
@@ -137,7 +137,7 @@ def print_response(result: dict, show_sources: bool):
             box=box.SIMPLE,
             header_style="#5c6370",
             show_edge=False,
-            padding=(0, 1)
+            padding=(0, 2)
         )
         source_table.add_column("file",      style="#61afef", no_wrap=True)
         source_table.add_column("chunk",     justify="right", style="#5c6370")
@@ -154,73 +154,187 @@ def print_response(result: dict, show_sources: bool):
 
         console.print(Panel(
             source_table,
-            title="[#5c6370]retrieved sources[/#5c6370]",
-            border_style="#3e4451",
-            padding=(0, 1)
+            title="[#5c6370]sources[/#5c6370]",
+            border_style="#1e1e2e",
+            padding=(0, 2)
         ))
 
-    savings = (
-        f"  [#5c6370]saved[/#5c6370] [#00ffaa]~{result.get('savings_pct', 0)}%[/#00ffaa]"
-        if result.get("savings_pct") else ""
+    t_embed    = result.get("t_embed", 0)
+    t_retrieve = result.get("t_retrieve", 0)
+    t_classify = result.get("t_classify", 0)
+    t_sub      = result.get("t_sub_tools", 0)
+    t_llm      = result.get("t_llm", 0)
+    savings    = result.get("savings_pct", 0)
+
+    cost_group = (
+        f"  [#e5c07b]{result['total_tokens']:,}[/#e5c07b] [#5c6370]tokens[/#5c6370]"
+        f"  [#e5c07b]${result['cost']:.4f}[/#e5c07b]"
     )
 
-    t_embed      = result.get("t_embed", 0)
-    t_retrieve   = result.get("t_retrieve", 0)
-    t_classify   = result.get("t_classify", 0)
-    t_sub_tools  = result.get("t_sub_tools", 0)
-    t_llm        = result.get("t_llm", 0)
-
-    console.print(
-        f"  [#5c6370]tokens[/#5c6370] [#abb2bf]{result['total_tokens']}[/#abb2bf]"
-        f"  [#5c6370]cost[/#5c6370] [#e5c07b]${result['cost']:.4f}[/#e5c07b]"
+    timing_group = (
         f"  [#5c6370]embed[/#5c6370] [#abb2bf]{t_embed}s[/#abb2bf]"
         f"  [#5c6370]retrieve[/#5c6370] [#abb2bf]{t_retrieve}s[/#abb2bf]"
         f"  [#5c6370]classify[/#5c6370] [#abb2bf]{t_classify}s[/#abb2bf]"
-        f"  [#5c6370]sub[/#5c6370] [#abb2bf]{t_sub_tools}s[/#abb2bf]"
-        f"  [#5c6370]llm[/#5c6370] [#abb2bf]{t_llm}s[/#abb2bf]"
+        + (f"  [#5c6370]sub[/#5c6370] [#abb2bf]{t_sub}s[/#abb2bf]" if t_sub > 0 else "")
+        + f"  [#5c6370]llm[/#5c6370] [#abb2bf]{t_llm}s[/#abb2bf]"
         f"  [#5c6370]total[/#5c6370] [#abb2bf]{result['response_time']}s[/#abb2bf]"
-        f"  [#5c6370]retrieval[/#5c6370] [#abb2bf]{result['retrieval_score']:.0%}[/#abb2bf]"
-        f"  [#5c6370]model[/#5c6370] [#c678dd]{result['model']}[/#c678dd]"
-        f"{savings}\n"
     )
+
+    model_group = (
+        f"  [#c678dd]{result['model']}[/#c678dd]"
+        f"  [#5c6370]{result['retrieval_score']:.0%} retrieval[/#5c6370]"
+        + (f"  [#00ffaa]~{savings}% saved[/#00ffaa]" if savings else "")
+    )
+
+    console.print(cost_group + "   " + timing_group + "   " + model_group + "\n")
 
 
 def print_status(s: dict):
-    table = Table(show_header=False, box=box.SIMPLE, show_edge=False, padding=(0, 2))
-    table.add_column(style="#5c6370")
-    table.add_column(style="#abb2bf")
-    table.add_row("indexed files",  str(s["total_files"]))
-    table.add_row("indexed chunks", str(s["total_chunks"]))
-    table.add_row("last indexed",   s["last_indexed"])
-    table.add_row("total queries",  str(s["total_queries"]))
-    table.add_row("total tokens",   str(s["total_tokens"]))
+    from datetime import datetime
+
+    try:
+        dt = datetime.fromisoformat(s["last_indexed"])
+        last_indexed = dt.strftime("%-d %b %Y, %H:%M")
+    except Exception:
+        last_indexed = s.get("last_indexed", "never")
+
+    table = Table(show_header=False, box=box.SIMPLE, show_edge=False, padding=(0, 3))
+    table.add_column(style="#5c6370", min_width=16)
+    table.add_column()
+
+    table.add_row("indexed files",  f"[#abb2bf]{s['total_files']}[/#abb2bf]")
+    table.add_row("indexed chunks", f"[#abb2bf]{s['total_chunks']}[/#abb2bf]")
+    table.add_row("last indexed",   f"[#abb2bf]{last_indexed}[/#abb2bf]")
+    table.add_row("", "")
+    table.add_row("total queries",  f"[#abb2bf]{s['total_queries']}[/#abb2bf]")
+    table.add_row("total tokens",   f"[#e5c07b]{s['total_tokens']:,}[/#e5c07b]")
     table.add_row("total cost",     f"[#e5c07b]${s['total_cost']:.4f}[/#e5c07b]")
-    table.add_row("avg response",   f"{s['avg_response_time']:.2f}s")
-    console.print(Panel(table, title="[#5c6370]status[/#5c6370]", border_style="#3e4451"))
+    table.add_row("avg response",   f"[#abb2bf]{s['avg_response_time']:.2f}s[/#abb2bf]")
+
+    console.print(Panel(
+        table,
+        title="[#5c6370]status[/#5c6370]",
+        border_style="#1e1e2e",
+        padding=(1, 2)
+    ))
+
+
+def _parse_history_msg(msg: str) -> tuple[str, str]:
+    """Parse votor commit message into (file, action) for clean display."""
+    import re
+
+    msg = msg.strip()
+
+    # Normalize encoding corruption (mojibake from cp1252/utf-8 mismatch)
+    msg = msg.replace("\xe2\x80\x94", "\u2014")   # UTF-8 bytes read as latin-1
+    msg = msg.replace("â\x80\x94", "\u2014")
+
+    # Strip votor: prefix
+    if msg.lower().startswith("votor:"):
+        msg = msg[6:].strip()
+
+    # Pattern: "edit session — FILE" (em dash or hyphen)
+    m = re.match('edit session\\s*[\u2014\\-]+\\s*(.+)', msg, re.IGNORECASE)
+    if m:
+        return m.group(1).strip(), "edit session"
+
+    # Pattern: "edited FILE (lines X-Y)"
+    m = re.match(r'(edited|created|deleted)\s+(.+?)\s+\((.+?)\)', msg, re.IGNORECASE)
+    if m:
+        return m.group(2).strip(), m.group(3).strip()
+
+    # Pattern: "edited FILE"
+    m = re.match(r'(edited|created|deleted)\s+(.+)', msg, re.IGNORECASE)
+    if m:
+        return m.group(2).strip(), m.group(1).lower()
+
+    if "revert" in msg.lower():
+        return "", "revert"
+
+    return msg, ""
 
 
 def print_history(history: list):
     if not history:
         console.print("[#5c6370]No AI changes recorded yet.[/#5c6370]\n")
         return
-    table = Table(show_header=True, box=box.SIMPLE, show_edge=False, padding=(0, 1))
-    table.add_column("#",       style="#5c6370", width=4)
-    table.add_column("hash",    style="#c678dd", width=9)
-    table.add_column("message", style="#abb2bf")
-    table.add_column("when",    style="#5c6370")
+
+    table = Table(show_header=True, box=box.SIMPLE, show_edge=False, padding=(0, 2))
+    table.add_column("#",      style="#5c6370",  width=4)
+    table.add_column("hash",   style="#c678dd",  width=9)
+    table.add_column("file",   style="#61afef",  min_width=24)
+    table.add_column("action", style="#5c6370",  min_width=14)
+    table.add_column("when",   style="#5c6370")
+
     for h in history:
-        table.add_row(str(h["n"]), h["hash"][:7], h["msg"], h["time"])
-    console.print(Panel(table, title="[#5c6370]ai change history[/#5c6370]", border_style="#3e4451"))
+        file_path, action = _parse_history_msg(h["msg"])
+        table.add_row(
+            str(h["n"]),
+            h["hash"][:7],
+            file_path or "[#5c6370]\u2014[/#5c6370]",
+            action    or "[#5c6370]\u2014[/#5c6370]",
+            h["time"]
+        )
+
+    console.print(Panel(
+        table,
+        title="[#5c6370]ai change history[/#5c6370]",
+        border_style="#1e1e2e",
+        padding=(1, 1)
+    ))
 
 
 def print_config(cfg: dict):
-    table = Table(show_header=False, box=box.SIMPLE, show_edge=False, padding=(0, 2))
-    table.add_column(style="#5c6370")
-    table.add_column(style="#00ffaa")
-    for k, v in cfg.items():
-        if not isinstance(v, list):
-            table.add_row(k.replace("_", " "), str(v))
-    console.print(Panel(table, title="[#5c6370]configuration[/#5c6370]", border_style="#3e4451"))
+    def pm(provider_key: str, model_key: str) -> str:
+        p = cfg.get(provider_key, "")
+        m = cfg.get(model_key, "")
+        return f"[#c678dd]{p}[/#c678dd] [#5c6370]/[/#5c6370] [#61afef]{m}[/#61afef]"
+
+    def val(v, color: str = "#abb2bf") -> str:
+        return f"[{color}]{v}[/{color}]"
+
+    def boolean(v) -> str:
+        return "[#00ffaa]on[/#00ffaa]" if v else "[#5c6370]off[/#5c6370]"
+
+    table = Table(show_header=False, box=box.SIMPLE, show_edge=False, padding=(0, 3))
+    table.add_column(style="#5c6370", min_width=18)
+    table.add_column()
+
+    # Agents
+    table.add_row("[#5c6370]agents[/#5c6370]", "")
+    table.add_row("main",       pm("main_provider", "main_model"))
+    table.add_row("fallback",   val(cfg.get("fallback_model", ""), "#61afef"))
+    table.add_row("sub",        pm("sub_provider", "sub_model"))
+    table.add_row("write mode", val(cfg.get("write_mode", "edit")))
+    table.add_row("verify",     boolean(cfg.get("verify_changes", False)))
+    table.add_row("", "")
+
+    # Embeddings
+    table.add_row("[#5c6370]embeddings[/#5c6370]", "")
+    table.add_row("provider",   val(cfg.get("embedding_provider", ""), "#c678dd"))
+    table.add_row("model",      val(cfg.get("embedding_model", ""),    "#61afef"))
+    table.add_row("", "")
+
+    # Index
+    table.add_row("[#5c6370]index[/#5c6370]", "")
+    table.add_row("top k",      val(cfg.get("top_k",         5),   "#e5c07b"))
+    table.add_row("chunk size", val(cfg.get("chunk_size",  200),   "#e5c07b"))
+    table.add_row("overlap",    val(cfg.get("chunk_overlap", 20),  "#e5c07b"))
+    table.add_row("", "")
+
+    # Git
+    table.add_row("[#5c6370]git[/#5c6370]", "")
+    table.add_row("remote",     val(cfg.get("git_remote", "none")))
+    git_url = cfg.get("git_remote_url", "")
+    if git_url:
+        table.add_row("url",    val(git_url, "#61afef"))
+
+    console.print(Panel(
+        table,
+        title="[#5c6370]configuration[/#5c6370]",
+        border_style="#1e1e2e",
+        padding=(1, 2)
+    ))
 
 
 # ---------------------------------------------------------------------------
