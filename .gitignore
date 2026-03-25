@@ -5,4 +5,5 @@ __pycache__/
 dist/
 build/
 .env
-.vectormind/.vectormind/qdrant/
+.vectormind/
+.vectormind/qdrant/

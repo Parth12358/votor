@@ -695,107 +695,152 @@ def run_edit_mode(
         }
 
     # -------------------------------------------------------------------------
-    # Phase 3: Sub executes plan steps mechanically
+    # Phase 3: Sub executes plan steps mechanically — with progress bar
     # -------------------------------------------------------------------------
-    console.print(f"\n  [#5c6370]executing [#abb2bf]{len(write_plan)}[/#abb2bf] step(s)...[/#5c6370]\n")
+    from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn
 
     steps_executed = []
+    total_steps    = len(write_plan)
 
-    # Build set of files being edited or created — delete is refused for these
+    # Build protected files set upfront — delete refused if file also edited/created
     protected_files = {
-        step.get("file", "")
-        for step in write_plan
-        if step.get("action") in ("edit", "create")
+        s.get("file", "")
+        for s in write_plan
+        if s.get("action") in ("edit", "create")
     }
 
-    for i, step in enumerate(write_plan):
-        action = step.get("action")
-        file   = step.get("file", "")
-        n      = i + 1
-        total  = len(write_plan)
+    console.print(
+        f"\n  [#5c6370]planning complete —[/#5c6370] "
+        f"[#abb2bf]{total_steps}[/#abb2bf] "
+        f"[#5c6370]step{'s' if total_steps != 1 else ''}[/#5c6370]\n"
+    )
 
-        # Normalize to relative path in case main used absolute path
-        project_root = str(Path(".").resolve())
-        if file.startswith(project_root):
-            file = file[len(project_root):].lstrip("\\/")
-            step["file"] = file  # update step so dispatch_tool also uses relative path
+    with Progress(
+        TextColumn("  "),
+        BarColumn(
+            bar_width=20,
+            complete_style="#00ffaa",
+            finished_style="#00ffaa",
+            pulse_style="#1e1e2e",
+        ),
+        MofNCompleteColumn(),
+        TextColumn("  [#5c6370]{task.description}[/#5c6370]"),
+        console=console,
+        transient=False,
+    ) as progress:
+        task = progress.add_task("starting...", total=total_steps)
 
-        # Guard — never allow modifications to .vectormind
-        if ".vectormind" in file:
-            console.print(f"  [#e06c75]✗ refused — .vectormind is protected[/#e06c75]")
+        for i, step in enumerate(write_plan):
+            action = step.get("action")
+            file   = step.get("file", "")
+
+            # Normalize absolute path to relative
+            project_root = str(Path(".").resolve())
+            if file.startswith(project_root):
+                file = file[len(project_root):].lstrip("\\/")
+                step["file"] = file
+
+            # Update bar description
+            progress.update(task, description=f"[#e5c07b]{action}[/#e5c07b] [#61afef]{file}[/#61afef]")
+
+            # Guard — never allow modifications to .vectormind
+            if ".vectormind" in file:
+                progress.stop()
+                console.print(f"  [#e06c75]✗ refused — .vectormind is protected[/#e06c75]")
+                progress.start()
+                steps_executed.append({
+                    "action": action, "file": file,
+                    "success": False,
+                    "error": "refused — .vectormind is protected",
+                    "diff_preview": None,
+                })
+                progress.advance(task)
+                continue
+
+            if action == "edit":
+                result = dispatch_tool("edit_file_lines", {
+                    "path":        file,
+                    "start_line":  str(step.get("start_line", 1)),
+                    "end_line":    str(step.get("end_line", 1)),
+                    "new_content": step.get("new_content", ""),
+                    "stage_only":  "true",
+                })
+                # Show diff inline after step completes
+                if result.get("success") and result.get("diff_preview"):
+                    progress.stop()
+                    show_diff(result["diff_preview"], title=f"edit — {file}")
+                    progress.start()
+
+            elif action == "create":
+                result = dispatch_tool("create_file", {
+                    "path":       file,
+                    "content":    step.get("content", ""),
+                    "stage_only": "true",
+                })
+                if not result.get("success") and "already exists" in str(result.get("error", "")):
+                    progress.stop()
+                    console.print(f"  [#5c6370]file exists — retrying as full replacement[/#5c6370]")
+                    progress.start()
+                    content_lines = step.get("content", "").splitlines()
+                    result = dispatch_tool("edit_file_lines", {
+                        "path":        file,
+                        "start_line":  "1",
+                        "end_line":    str(len(content_lines) + 100),
+                        "new_content": step.get("content", ""),
+                        "stage_only":  "true",
+                    })
+                    if result.get("success") and result.get("diff_preview"):
+                        progress.stop()
+                        show_diff(result["diff_preview"], title=f"create (replaced) — {file}")
+                        progress.start()
+
+            elif action == "delete":
+                if file in protected_files:
+                    result = {
+                        "success": False,
+                        "error": "refused — cannot delete a file that is also being edited",
+                    }
+                    progress.stop()
+                    console.print(f"  [#e06c75]✗ refused — {file} is also being edited[/#e06c75]")
+                    progress.start()
+                else:
+                    progress.stop()
+                    console.print(f"  [#e06c75]⚠ delete requested:[/#e06c75] [#61afef]{file}[/#61afef]")
+                    console.print(
+                        f"  [#5c6370]Type [#e06c75]yes[/#e06c75] to confirm or anything else to skip:[/#5c6370] ",
+                        end="",
+                    )
+                    try:
+                        confirm = input().strip().lower()
+                    except Exception:
+                        confirm = ""
+                    if confirm == "yes":
+                        result = dispatch_tool("delete_file", {"path": file, "stage_only": "true"})
+                    else:
+                        result = {"success": False, "error": "skipped by user"}
+                        console.print(f"  [#5c6370]skipped[/#5c6370]")
+                    progress.start()
+
+            else:
+                result = {"success": False, "error": f"unknown action: {action}"}
+
+            # Print error inline if failed
+            if not result.get("success"):
+                progress.stop()
+                console.print(f"  [#e06c75]✗ {result.get('error', 'unknown error')}[/#e06c75]")
+                progress.start()
+
             steps_executed.append({
                 "action":       action,
                 "file":         file,
-                "success":      False,
-                "error":        "refused — .vectormind is protected",
-                "diff_preview": None,
+                "success":      result.get("success", False),
+                "error":        result.get("error"),
+                "diff_preview": result.get("diff_preview"),
             })
-            continue
 
-        console.print(f"  [#5c6370][{n}/{total}][/#5c6370] [#e5c07b]{action}[/#e5c07b] [#61afef]{file}[/#61afef]")
+            progress.advance(task)
 
-        if action == "edit":
-            result = dispatch_tool("edit_file_lines", {
-                "path":        file,
-                "start_line":  str(step.get("start_line", 1)),
-                "end_line":    str(step.get("end_line", 1)),
-                "new_content": step.get("new_content", ""),
-                "stage_only":  "true",
-            })
-            # diff is shown inside edit_file_lines — no need to show again here
-
-        elif action == "create":
-            result = dispatch_tool("create_file", {
-                "path":      file,
-                "content":   step.get("content", ""),
-                "stage_only": "true",
-            })
-            # Fallback — if file exists, overwrite via edit_file_lines (full file replacement)
-            if not result.get("success") and "already exists" in str(result.get("error", "")):
-                console.print(f"  [#5c6370]file exists — retrying as full file replacement[/#5c6370]")
-                content_lines = step.get("content", "").splitlines()
-                result = dispatch_tool("edit_file_lines", {
-                    "path":        file,
-                    "start_line":  "1",
-                    "end_line":    str(len(content_lines) + 100),  # cover entire file
-                    "new_content": step.get("content", ""),
-                    "stage_only":  "true",
-                })
-
-        elif action == "delete":
-            # Refuse delete if file is also being edited or created in this plan
-            if file in protected_files:
-                result = {"success": False, "error": "refused — cannot delete a file that is also being edited in this plan"}
-                console.print(f"  [#e06c75]✗ refused — {file} is also being edited in this plan[/#e06c75]")
-            else:
-                console.print(f"  [#e06c75]⚠ delete requested:[/#e06c75] [#61afef]{file}[/#61afef]")
-                console.print(f"  [#5c6370]Type [#e06c75]yes[/#e06c75] to confirm or anything else to skip:[/#5c6370] ", end="")
-                try:
-                    confirm = input().strip().lower()
-                except Exception:
-                    confirm = ""
-                if confirm == "yes":
-                    result = dispatch_tool("delete_file", {"path": file, "stage_only": "true"})
-                else:
-                    result = {"success": False, "error": "skipped by user"}
-                    console.print(f"  [#5c6370]skipped.[/#5c6370]")
-
-        else:
-            result = {"success": False, "error": f"unknown action: {action}"}
-
-        status = "[#00ffaa]✓[/#00ffaa]" if result.get("success") else "[#e06c75]✗[/#e06c75]"
-        if result.get("success"):
-            console.print(f"  {status} [#5c6370]{action} complete[/#5c6370]")
-        else:
-            console.print(f"  {status} [#e06c75]{result.get('error', 'unknown error')}[/#e06c75]")
-
-        steps_executed.append({
-            "action":       action,
-            "file":         file,
-            "success":      result.get("success", False),
-            "error":        result.get("error"),
-            "diff_preview": result.get("diff_preview"),
-        })
+    console.print()
 
     # Batch commit all staged changes after all steps complete
     from votor.tools import git_commit_staged

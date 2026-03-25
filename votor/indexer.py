@@ -41,7 +41,7 @@ def load_config() -> dict:
         "exclude_dirs": [
             ".vectormind", ".git", "node_modules",
             "__pycache__", ".venv", "venv",
-            "dist", "build", ".next"
+            "dist", "build", ".next", "votor.egg-info"
         ]
     }
 
