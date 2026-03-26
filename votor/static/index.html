@@ -607,12 +607,50 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
 const S={panel:'chat',busy:false,src:false,think:false,ws:null,ready:false,cfg:{},curBubble:null,curFoot:null};
 
 // ── WebSocket ───────────────────────────────────────────
-function connectWS(){
-  const ws=new WebSocket(`ws://${location.host}/ws/dashboard`);
-  S.ws=ws;
-  ws.onopen=()=>{S.ready=true;setStatus('ready',false);ws.send(JSON.stringify({type:'get_init'}))};
-  ws.onclose=()=>{S.ready=false;setStatus('offline',false);document.getElementById('dot').className='dot off';setTimeout(connectWS,3000)};
-  ws.onmessage=e=>handleEv(JSON.parse(e.data));
+function connectWS() {
+  // Try ws://localhost first, fall back to 127.0.0.1
+  const hosts = ['localhost:8000', '127.0.0.1:8000'];
+  let hostIdx = 0;
+
+  function tryConnect() {
+    const host = hosts[hostIdx % hosts.length];
+    const url  = `ws://${host}/ws/dashboard`;
+    console.log('[votor] connecting to', url);
+
+    const ws = new WebSocket(url);
+    S.ws = ws;
+
+    ws.onopen = () => {
+      S.ready = true;
+      console.log('[votor] connected to', url);
+      setStatus('ready', false);
+      setConnStatus('connected');
+      ws.send(JSON.stringify({ type: 'get_init' }));
+    };
+
+    ws.onclose = (e) => {
+      S.ready = false;
+      console.log('[votor] disconnected from', url, 'code:', e.code);
+      setStatus('offline', false);
+      document.getElementById('dot').className = 'dot off';
+      setConnStatus('disconnected');
+      // Try next host on failure, then retry after delay
+      hostIdx++;
+      setTimeout(tryConnect, hostIdx <= hosts.length ? 500 : 3000);
+    };
+
+    ws.onerror = (e) => {
+      console.log('[votor] ws error on', url, e);
+    };
+
+    ws.onmessage = e => {
+      const ev = JSON.parse(e.data);
+      console.log('[votor ws] received:', ev.type, ev);
+      handleEv(ev);
+    };
+  }
+
+  tryConnect();
 }
 function wsSend(o){if(!S.ready){toast('not connected','error');return;}S.ws.send(JSON.stringify(o))}
 
@@ -682,7 +720,16 @@ function appendStep(cur,total,action,file){
   ap(mk(`<div class="step-prog"><span class="g">${'█'.repeat(Math.round(p/5))}${'░'.repeat(20-Math.round(p/5))}</span><span class="y"> ${cur}/${total}</span> ${esc(action)} <span class="b">${esc(file)}</span></div>`));
 }
 function finalMsg(ev){
-  S.curBubble?.querySelector('.cursor')?.remove();S.curBubble=null;
+  // No streaming bubble was started (headless mode) — render answer directly from ev.answer
+  if(!S.curBubble && ev.answer){
+    startAsstBubble();
+    S.curBubble.querySelector('.cursor')?.remove();
+    const s=document.createElement('span');
+    s.textContent=ev.answer;
+    S.curBubble.appendChild(s);
+  }
+  S.curBubble?.querySelector('.cursor')?.remove();
+  S.curBubble=null;
   if(S.curFoot&&ev.tokens!=null){
     S.curFoot.style.display='flex';
     S.curFoot.innerHTML=`<span><span class="vy">${(ev.tokens||0).toLocaleString()}</span> tokens</span><span><span class="vy">$${(ev.cost||0).toFixed(4)}</span></span><span>total <span class="v">${ev.response_time||0}s</span></span><span><span class="vp">${ev.model||''}</span></span><span><span class="v">${Math.round((ev.retrieval_score||0)*100)}%</span> retrieval</span>`;

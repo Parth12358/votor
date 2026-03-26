@@ -117,6 +117,17 @@ def invalidate_full_context_cache():
     _full_context_tokens_dirty = True
 
 
+# Per-thread headless flag — prevents concurrent REPL and dashboard queries from sharing state
+import threading as _threading
+_tls = _threading.local()
+
+def _is_headless() -> bool:
+    return getattr(_tls, "headless_mode", False)
+
+def _set_headless(value: bool):
+    _tls.headless_mode = value
+
+
 # ---------------------------------------------------------------------------
 # Context assembly
 # ---------------------------------------------------------------------------
@@ -990,19 +1001,29 @@ def needs_fallback(answer: str, model: str, fallback: str) -> bool:
 
 def _stream_to_console(stream_gen, show_thinking: bool = False) -> dict:
     """
-    Stream tokens to console in real time.
-    After stream completes, clears the streamed output using Rich's
-    own line tracking so print_response() can render a clean panel.
-    Works correctly on Windows with ConPTY.
+    Stream tokens to console. In headless mode (dashboard thread),
+    consumes the stream silently without touching the console.
     """
+    result       = {}
+    full_content = ""
+
+    if _is_headless():
+        # Consume stream silently — no console interaction
+        for chunk in stream_gen:
+            if isinstance(chunk, str):
+                full_content += chunk
+            else:
+                result = chunk
+        if full_content and not result.get("content"):
+            result["content"] = full_content
+        return result
+
     from rich.control import Control
 
-    result        = {}
-    full_content  = ""
     style         = "#5c6370" if show_thinking else "#abb2bf"
     lines_printed = 0
 
-    console.print()   # newline before streaming
+    console.print()
     lines_printed += 1
 
     for chunk in stream_gen:
@@ -1013,10 +1034,9 @@ def _stream_to_console(stream_gen, show_thinking: bool = False) -> dict:
         else:
             result = chunk
 
-    console.print()   # newline after streaming
+    console.print()
     lines_printed += 1
 
-    # Clear all streamed lines via Rich Control (works on Windows ConPTY)
     if lines_printed > 0:
         console.control(Control.move_to_column(0))
         for _ in range(lines_printed):
@@ -1065,6 +1085,7 @@ def run_query(
         client, _ = get_collection()
         results   = query_chunks(client, query_embedding, top_k=top_k)
     t_retrieve = round(time.time() - t0, 2)
+
 
     if not results["documents"]:
         return {
@@ -1131,16 +1152,15 @@ def run_query(
             # Auto /update after edit to re-index changed files
             try:
                 from votor.indexer import index_project
+                from votor.db import close_client
                 invalidate_full_context_cache()
                 console.print(f"\n  [#5c6370]auto-updating index...[/#5c6370]")
+                close_client()  # release Qdrant lock before re-opening in indexer
                 index_project(incremental=True, force=False, config=config)
                 invalidate_full_context_cache()
                 console.print(f"  [#00ffaa]✓[/#00ffaa] [#5c6370]index updated[/#5c6370]\n")
             except Exception as e:
-                if "already accessed" in str(e):
-                    console.print(f"  [#5c6370]run [#00ffaa]/update[/#00ffaa] to re-index changes[/#5c6370]\n")
-                else:
-                    console.print(f"  [#e06c75]index update failed: {e}[/#e06c75]\n")
+                console.print(f"  [#e06c75]index update failed: {e}[/#e06c75]\n")
 
             elapsed = round(time.time() - start_time, 2)
             cost    = calculate_cost(

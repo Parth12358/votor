@@ -19,6 +19,14 @@
 | PyPI / GitHub | Workflow for automated releases documented |
 | .gitignore | `.vectormind/` fully ignored |
 | README | Updated with hybrid config, ollama models, accurate install instructions |
+| Edit mode progress bar | Phase 3 execution loop replaced with Rich `Progress` bar — updates description per step, diffs print inline below bar, errors print inline, delete confirmation pauses bar (`query.py`) |
+| 1a egg-info exclude | `votor.egg-info` added to `exclude_dirs` in `DEFAULT_CONFIG` (`init_flow.py`) and default config in `indexer.py` |
+| 1c Qdrant concurrent access | `close_client()` added to `db.py` with module-level `_client` cache; called before `index_project()` in auto-update block so Qdrant lock is released before re-indexing (`query.py`, `db.py`) |
+| Dashboard rebuild | Full rewrite of `dashboard.py` — FastAPI + WebSocket (`/ws/dashboard`), REST endpoints for analytics/status/history/diff/undo/revert/config/side-chat, `start_dashboard()` daemon thread launcher, `broadcast_sync()` using captured `_event_loop`, plain `threading.Thread` for query/index handlers, `access_log=False`, uvicorn on `0.0.0.0` |
+| Dashboard launch on startup | `repl.py` starts dashboard server at launch, prints clickable `http://127.0.0.1:8000` link; `handle_dashboard()` reuses running server instead of spawning subprocess |
+| Dashboard WS reconnect | `connectWS` in `index.html` tries `localhost:8000` then `127.0.0.1:8000`, logs connect/disconnect/error to browser console |
+| Dashboard terminal parity | Terminal shows `dashboard ❯ query`, then sub/main status lines, then the same panel and metrics footer as REPL queries. Panel title shows `(dashboard / model)`. Prompt reprinted after response. Null console swap removed — `qmod.console` stays as real terminal so all `console.print` calls in `run_query()` flow through. `_set_headless(True)` still silences streamed tokens in `_stream_to_console`. |
+| 1d Debug print cleanup | All `[votor dashboard]`, `[votor run_query]`, `[votor headless]`, and `sub raw:` debug prints removed from `dashboard.py` and `query.py`. |
 
 ---
 
@@ -60,9 +68,8 @@ The current UI is functional but clunky. Every surface needs a pass — init wiz
 - Current: flat key-value dump
 - Goal: grouped sections (main agent, sub agent, embeddings, index settings) with current values highlighted
 
-**Edit mode progress**
-- Current: inline console prints during execution
-- Goal: live progress bar or step tracker showing which steps are complete, in progress, or failed
+**Edit mode progress** ✓ DONE
+- Rich `Progress` bar replaces inline prints — description updates per step, diffs and errors print inline below bar
 
 **General**
 - Consistent color language across all views — success, warning, error, dim
@@ -75,15 +82,14 @@ The current UI is functional but clunky. Every surface needs a pass — init wiz
 
 ---
 
-### 0b. Dashboard Redesign — PRIORITY 2
+### 0b. Dashboard Redesign — PRIORITY 2 ✓ BACKEND DONE / FRONTEND PARTIAL
 
-The current dashboard is broken — doesn't launch reliably, shows no data, and charts are empty. The redesigned dashboard should be a **complete GUI alternative to the terminal** — everything a user can do in the terminal REPL should be doable from the browser. Plus an optional side chat panel where users can connect any LLM of their preference as a companion.
+Backend fully rewritten — WebSocket, REST endpoints, daemon thread launcher, event loop capture, thread-safe broadcast. Dashboard starts on REPL launch with clickable link. WS reconnect logic tries localhost then 127.0.0.1.
 
-**What's broken:**
-- FastAPI + uvicorn launch fails silently in some environments
-- Analytics data from SQLite not being read correctly by the dashboard endpoints
-- Chart.js charts render empty — likely API response format mismatch
-- No error feedback to the user when `/dashboard` fails
+**Remaining frontend gaps:**
+- Analytics charts still rendering empty (API response format may need verification)
+- Streaming chat responses not yet wired (query runs but doesn't stream tokens)
+- Edit mode step progress not shown in dashboard chat view
 
 **Full terminal parity — everything the REPL can do:**
 
@@ -91,7 +97,8 @@ The current dashboard is broken — doesn't launch reliably, shows no data, and 
 - Full chat interface connected to the same `run_query()` pipeline
 - Streaming responses in real time via WebSocket
 - Supports read mode and edit mode queries
-- Shows sub/main call indicators, token counts, cost, timing — same as terminal footer
+- Shows token counts, cost, timing in answer — same as terminal footer ✓ Done via `query_complete` event
+- Sub/main call indicators (`sub → classify`, `main → call 1/2`) still need to be broadcast as `log` events so the browser chat shows them in real time — terminal already shows them now
 - Edit mode shows step execution progress, diffs inline, batch commit confirmation
 - Message history for the session
 - `/sources` toggle, `/thinking` toggle available as buttons
@@ -143,8 +150,8 @@ The current dashboard is broken — doesn't launch reliably, shows no data, and 
 
 ### 1. Loose Ends (quick fixes, do second)
 
-**1a — `votor.egg-info/SOURCES.txt` shows in retrieval sources**
-This file keeps appearing in retrieval results with low relevance scores. Add `votor.egg-info` to `exclude_dirs` in `DEFAULT_CONFIG` in `init_flow.py` and `load_config()` in `indexer.py`.
+**1a — `votor.egg-info/SOURCES.txt` shows in retrieval sources** ✓ DONE
+Added `votor.egg-info` to `exclude_dirs` in `DEFAULT_CONFIG` (`init_flow.py`) and default config (`indexer.py`).
 
 **1b — `pyproject.toml` keywords still say `chromadb`**
 Update keywords to reflect actual stack:
@@ -152,8 +159,8 @@ Update keywords to reflect actual stack:
 keywords = ["ai", "vector", "coding", "assistant", "qdrant", "ollama", "openai", "anthropic", "rag"]
 ```
 
-**1c — `/update` after edit mode uses Qdrant concurrent access**
-Currently shows "run /update to re-index changes" message. The Qdrant client needs to be closed and reopened between the edit session and the index update. Or defer the update to a background thread after the Qdrant connection from `run_query()` is released.
+**1c — `/update` after edit mode uses Qdrant concurrent access** ✓ DONE
+`close_client()` added to `db.py`; called before `index_project()` in auto-update block. Lock is released cleanly before re-indexing. Removed the "already accessed" special-case fallback message.
 
 **1d — Debug print still in `classify_intent()`**
 The `sub raw:` debug print added during diagnosis may still be in `query.py`. Verify and remove if present.
@@ -351,18 +358,18 @@ Allow multiple votor instances to run in the same project simultaneously without
 
 ## Summary Table
 
-| Item | Effort | Priority |
-|---|---|---|
-| 0 UI/UX redesign | Large | Top — affects every interaction |
-| 0b Dashboard rebuild | Large | Priority 2 — full GUI + chat + config |
-| 1a egg-info exclude | Trivial | High — affects retrieval quality now |
-| 1b pyproject keywords | Trivial | Medium — cosmetic |
-| 1c Qdrant concurrent access on auto-update | Small | High — affects UX after every edit |
-| 1d debug print cleanup | Trivial | High — shouldn't be in production |
-| 2 Reason mode | Medium | Medium — useful but edit mode covers most cases |
-| 3 Chunk rewrite (Option B) | Large | Low — needs more planning |
-| 4 Conversation memory | Medium | Medium — significant UX improvement |
-| 5 Multi-file edit support | Medium | High — needed for real refactor tasks |
-| 6 Step mode (interactive todo list) | Medium | High — safety net for sensitive changes |
-| 7 Watch mode | Small | Low — quality of life |
-| 8 Parallel client support | Medium | Low — nice to have for power users |
+| Item | Effort | Priority | Status |
+|---|---|---|---|
+| 0 UI/UX redesign | Large | Top — affects every interaction | Partial — edit mode progress bar done |
+| 0b Dashboard rebuild | Large | Priority 2 — full GUI + chat + config | Partial — terminal parity done, browser gaps remain |
+| 1a egg-info exclude | Trivial | High — affects retrieval quality now | ✓ Done |
+| 1b pyproject keywords | Trivial | Medium — cosmetic | Open |
+| 1c Qdrant concurrent access on auto-update | Small | High — affects UX after every edit | ✓ Done |
+| 1d debug print cleanup | Trivial | High — shouldn't be in production | ✓ Done |
+| 2 Reason mode | Medium | Medium — useful but edit mode covers most cases | Open |
+| 3 Chunk rewrite (Option B) | Large | Low — needs more planning | Shelved |
+| 4 Conversation memory | Medium | Medium — significant UX improvement | Open |
+| 5 Multi-file edit support | Medium | High — needed for real refactor tasks | Open |
+| 6 Step mode (interactive todo list) | Medium | High — safety net for sensitive changes | Open |
+| 7 Watch mode | Small | Low — quality of life | Open |
+| 8 Parallel client support | Medium | Low — nice to have for power users | Open |

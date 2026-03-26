@@ -473,14 +473,12 @@ def handle_provider():
 
 
 def handle_dashboard():
-    console.print("[#5c6370]Launching dashboard at [#61afef]http://localhost:8000[/#61afef]...[/#5c6370]")
-    import subprocess
-    subprocess.Popen(
-        [sys.executable, "-m", "uvicorn", "votor.dashboard:app", "--port", "8000"],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL
-    )
-    console.print("[#00ffaa]✓[/#00ffaa] Dashboard at [link=http://localhost:8000]http://localhost:8000[/link]\n")
+    try:
+        from votor.dashboard import start_dashboard
+        url = start_dashboard(port=8000, open_browser=True)
+        console.print(f"  [#00ffaa]✓[/#00ffaa] [#61afef][link={url}]{url}[/link][/#61afef]\n")
+    except Exception as e:
+        console.print(f"  [#e06c75]✗ dashboard failed: {e}[/#e06c75]\n")
 
 
 def handle_query(question: str, show_sources: bool, show_thinking: bool = False):
@@ -506,6 +504,16 @@ def handle_query(question: str, show_sources: bool, show_thinking: bool = False)
 
 def main():
     VOTOR_DIR.mkdir(exist_ok=True)
+
+    # Start dashboard server
+    try:
+        from votor.dashboard import start_dashboard
+        import time
+        dashboard_url = start_dashboard(port=8000)
+        time.sleep(0.3)  # let server start before printing anything
+    except Exception:
+        dashboard_url = None
+
     print_banner()
 
     project_name = Path.cwd().name
@@ -517,7 +525,13 @@ def main():
             border_style="#3e4451"
         ))
     else:
-        console.print(f"  [#5c6370]project[/#5c6370] [#61afef]{project_name}[/#61afef]")
+        console.print(f"  [#5c6370]project[/#5c6370]    [#61afef]{project_name}[/#61afef]")
+        if dashboard_url:
+            console.print(
+                f"  [#5c6370]dashboard[/#5c6370]   "
+                f"[#61afef][link={dashboard_url}]{dashboard_url}[/link][/#61afef]"
+                f"  [#5c6370]← click to open[/#5c6370]"
+            )
         console.print(f"  [#5c6370]type [#00ffaa]/help[/#00ffaa] for commands or just ask a question[/#5c6370]\n")
 
     session = PromptSession(

@@ -1,5 +1,7 @@
+import atexit
 import json
 import hashlib
+import threading
 from pathlib import Path
 from datetime import datetime
 from typing import Optional
@@ -51,9 +53,32 @@ def load_config() -> dict:
 # Client + Collection
 # ---------------------------------------------------------------------------
 
+_client: Optional[QdrantClient] = None
+_client_lock = threading.Lock()
+
+
 def get_client() -> QdrantClient:
-    QDRANT_DIR.mkdir(parents=True, exist_ok=True)
-    return QdrantClient(path=str(QDRANT_DIR))
+    global _client
+    with _client_lock:
+        if _client is None:
+            QDRANT_DIR.mkdir(parents=True, exist_ok=True)
+            _client = QdrantClient(path=str(QDRANT_DIR))
+        return _client
+
+
+def close_client():
+    """Close the cached Qdrant client to release the storage lock."""
+    global _client
+    with _client_lock:
+        if _client is not None:
+            try:
+                _client.close()
+            except Exception:
+                pass
+            _client = None
+
+
+atexit.register(close_client)
 
 
 def get_or_create_collection(client: QdrantClient, vector_size: int):

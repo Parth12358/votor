@@ -1,8 +1,27 @@
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse
+import asyncio
+import json
+import threading
+import webbrowser
+from contextlib import asynccontextmanager
+from pathlib import Path
+
+import uvicorn
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 
-app = FastAPI(title="Direction Dashboard", docs_url=None, redoc_url=None)
+_event_loop = None  # set once at server startup via lifespan
+
+
+@asynccontextmanager
+async def _lifespan(app):
+    global _event_loop
+    _event_loop = asyncio.get_running_loop()
+    yield
+
+
+app = FastAPI(title="votor dashboard", docs_url=None, redoc_url=None, lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -11,725 +30,374 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-from dotenv import load_dotenv
-load_dotenv()
+STATIC_DIR   = Path(__file__).parent / "static"
+CONFIG_FILE  = Path(".vectormind/config.json")
+
+# Connected dashboard WebSocket clients
+_ws_clients: list[WebSocket] = []
+_ws_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
-# API Routes
+# WebSocket
 # ---------------------------------------------------------------------------
 
-@app.get("/api/summary")
-def api_summary():
-    from direction.analytics import get_summary
-    return get_summary()
+@app.websocket("/ws/dashboard")
+async def ws_dashboard(ws: WebSocket):
+    await ws.accept()
+    with _ws_lock:
+        _ws_clients.append(ws)
+    try:
+        cfg = {}
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+        await ws.send_json({
+            "type":          "init",
+            "project":       Path(".").resolve().name,
+            "main_provider": cfg.get("main_provider", ""),
+            "main_model":    cfg.get("main_model", ""),
+            "config":        cfg,
+        })
+
+        while True:
+            data = await ws.receive_json()
+            await _handle_ws_message(ws, data)
+
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        pass
+    finally:
+        with _ws_lock:
+            if ws in _ws_clients:
+                _ws_clients.remove(ws)
 
 
-@app.get("/api/queries")
-def api_queries(limit: int = 20):
-    from direction.analytics import get_recent_queries
-    return get_recent_queries(limit=limit)
+async def _handle_ws_message(ws: WebSocket, data: dict):
+    """Handle incoming messages from dashboard clients."""
+    msg_type = data.get("type")
+
+    if msg_type == "get_init":
+        cfg = {}
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+        await ws.send_json({
+            "type":          "init",
+            "project":       Path(".").resolve().name,
+            "main_provider": cfg.get("main_provider", ""),
+            "main_model":    cfg.get("main_model", ""),
+            "config":        cfg,
+        })
+
+    elif msg_type == "query":
+        t = threading.Thread(target=_run_query_from_dashboard, args=(data,), daemon=True)
+        t.start()
+
+    elif msg_type == "index_force":
+        broadcast_sync({"type": "busy", "busy": True})
+        t = threading.Thread(target=_run_index, args=(True,), daemon=True)
+        t.start()
+
+    elif msg_type == "index_update":
+        broadcast_sync({"type": "busy", "busy": True})
+        t = threading.Thread(target=_run_index, args=(False,), daemon=True)
+        t.start()
 
 
-@app.get("/api/daily")
-def api_daily(days: int = 30):
-    from direction.analytics import get_daily_stats
-    return get_daily_stats(days=days)
+def _run_query_from_dashboard(data: dict):
+    """Run a votor query triggered from the dashboard."""
+    from rich.console import Console as RichConsole
+    from rich.panel import Panel
+    from rich.markdown import Markdown
+    import votor.query as qmod
+    from votor.query import run_query, _set_headless
+
+    question      = data.get("text", "")
+    show_sources  = data.get("show_sources", False)
+    show_thinking = data.get("show_thinking", False)
+
+    broadcast_sync({"type": "input_received", "source": "dashboard", "text": question})
+    _term = RichConsole()
+    _term.print(f"\n  [#5c6370]dashboard[/#5c6370] [#61afef]❯[/#61afef] [#abb2bf]{question}[/#abb2bf]")
+    broadcast_sync({"type": "busy", "busy": True})
+
+    try:
+        _set_headless(True)  # silence streamed answer text in _stream_to_console
+        result = run_query(
+            question,
+            show_sources=show_sources,
+            show_thinking=show_thinking,
+        )
+        _term.print(Panel(
+            Markdown(result.get("answer", "")),
+            title=f"[bold #00ffaa]votor[/bold #00ffaa] [#5c6370](dashboard / {result.get('model','')})[/#5c6370]",
+            border_style="#1e1e2e",
+            padding=(1, 2)
+        ))
+        t_embed    = result.get("t_embed", 0)
+        t_retrieve = result.get("t_retrieve", 0)
+        t_classify = result.get("t_classify", 0)
+        t_sub      = result.get("t_sub_tools", 0)
+        t_llm      = result.get("t_llm", 0)
+        savings    = result.get("savings_pct", 0)
+        _term.print(
+            f"  [#e5c07b]{result.get('total_tokens',0):,}[/#e5c07b] [#5c6370]tokens[/#5c6370]"
+            f"  [#e5c07b]${result.get('cost',0):.4f}[/#e5c07b]"
+            f"  [#5c6370]embed[/#5c6370] [#abb2bf]{t_embed}s[/#abb2bf]"
+            f"  [#5c6370]retrieve[/#5c6370] [#abb2bf]{t_retrieve}s[/#abb2bf]"
+            f"  [#5c6370]classify[/#5c6370] [#abb2bf]{t_classify}s[/#abb2bf]"
+            + (f"  [#5c6370]sub[/#5c6370] [#abb2bf]{t_sub}s[/#abb2bf]" if t_sub > 0 else "")
+            + f"  [#5c6370]llm[/#5c6370] [#abb2bf]{t_llm}s[/#abb2bf]"
+            f"  [#5c6370]total[/#5c6370] [#abb2bf]{result.get('response_time',0)}s[/#abb2bf]"
+            f"  [#c678dd]{result.get('model','')}[/#c678dd]"
+            + (f"  [#00ffaa]~{savings}% saved[/#00ffaa]" if savings else "")
+            + "\n"
+        )
+        _term.print(
+            f"[bold #61afef]{Path('.').resolve().name}[/bold #61afef]"
+            f"[#56b6c2] ❯ [/#56b6c2]"
+            f"[bold #00ffaa]votor[/bold #00ffaa] ",
+            end="",
+        )
+        broadcast_sync({
+            "type":            "query_complete",
+            "tokens":          result.get("total_tokens", 0),
+            "cost":            result.get("cost", 0),
+            "response_time":   result.get("response_time", 0),
+            "model":           result.get("model", ""),
+            "retrieval_score": result.get("retrieval_score", 0),
+            "answer":          result.get("answer", ""),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        _term.print(f"  [#e06c75]✗ dashboard query failed: {e}[/#e06c75]\n")
+        broadcast_sync({"type": "error", "message": str(e)})
+    finally:
+        _set_headless(False)
+        try:
+            broadcast_sync({"type": "busy", "busy": False})
+        except Exception:
+            pass
 
 
-@app.get("/api/files")
-def api_files(limit: int = 10):
-    from direction.analytics import get_top_files
-    return get_top_files(limit=limit)
+def _run_index(force: bool):
+    """Run index triggered from dashboard."""
+    from votor.indexer import index_project
+    try:
+        stats = index_project(incremental=not force, force=force)
+        broadcast_sync({
+            "type":   "index_complete",
+            "files":  stats.get("files", 0),
+            "chunks": stats.get("chunks", 0),
+        })
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        broadcast_sync({"type": "error", "message": str(e)})
+    finally:
+        try:
+            broadcast_sync({"type": "busy", "busy": False})
+        except Exception:
+            pass
 
 
-@app.get("/api/models")
-def api_models():
-    from direction.analytics import get_model_breakdown
-    return get_model_breakdown()
-
-
-@app.get("/api/savings")
-def api_savings(days: int = 30):
-    from direction.analytics import get_token_savings_trend
-    return get_token_savings_trend(days=days)
-
-
-@app.get("/api/db-stats")
-def api_db_stats():
-    from direction.db import get_stats
-    return get_stats()
+def broadcast_sync(event: dict):
+    """Broadcast an event to all connected dashboard WebSocket clients (thread-safe)."""
+    if _event_loop is None:
+        return
+    with _ws_lock:
+        clients = list(_ws_clients)
+    if not clients:
+        return
+    dead = []
+    for ws in clients:
+        try:
+            fut = asyncio.run_coroutine_threadsafe(ws.send_json(event), _event_loop)
+            fut.add_done_callback(lambda f: None)
+        except Exception:
+            dead.append(ws)
+    if dead:
+        with _ws_lock:
+            for ws in dead:
+                if ws in _ws_clients:
+                    _ws_clients.remove(ws)
 
 
 # ---------------------------------------------------------------------------
-# Dashboard HTML
+# REST API
 # ---------------------------------------------------------------------------
 
-DASHBOARD_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8"/>
-<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Direction</title>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
-<style>
-  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700&family=Syne:wght@400;600;800&display=swap');
-
-  :root {
-    --bg:       #0a0a0f;
-    --surface:  #111118;
-    --border:   #1e1e2e;
-    --accent:   #00ff9d;
-    --accent2:  #7c6af7;
-    --warn:     #ff6b35;
-    --text:     #e2e2f0;
-    --muted:    #5a5a7a;
-    --card-bg:  #13131f;
-  }
-
-  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
-  body {
-    background: var(--bg);
-    color: var(--text);
-    font-family: 'JetBrains Mono', monospace;
-    min-height: 100vh;
-    overflow-x: hidden;
-  }
-
-  /* Scanline overlay */
-  body::before {
-    content: '';
-    position: fixed;
-    inset: 0;
-    background: repeating-linear-gradient(
-      0deg,
-      transparent,
-      transparent 2px,
-      rgba(0,255,157,0.015) 2px,
-      rgba(0,255,157,0.015) 4px
-    );
-    pointer-events: none;
-    z-index: 9999;
-  }
-
-  header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 1.5rem 2.5rem;
-    border-bottom: 1px solid var(--border);
-    background: var(--surface);
-    position: sticky;
-    top: 0;
-    z-index: 100;
-  }
-
-  .logo {
-    font-family: 'Syne', sans-serif;
-    font-weight: 800;
-    font-size: 1.4rem;
-    letter-spacing: -0.02em;
-    color: var(--accent);
-    display: flex;
-    align-items: center;
-    gap: 0.6rem;
-  }
-
-  .logo-dot {
-    width: 8px; height: 8px;
-    background: var(--accent);
-    border-radius: 50%;
-    animation: pulse 2s infinite;
-  }
-
-  @keyframes pulse {
-    0%, 100% { opacity: 1; transform: scale(1); }
-    50% { opacity: 0.4; transform: scale(0.8); }
-  }
-
-  .header-meta {
-    font-size: 0.7rem;
-    color: var(--muted);
-    text-align: right;
-    line-height: 1.6;
-  }
-
-  .header-meta span { color: var(--accent); }
-
-  main {
-    max-width: 1400px;
-    margin: 0 auto;
-    padding: 2rem 2.5rem;
-    display: flex;
-    flex-direction: column;
-    gap: 2rem;
-  }
-
-  /* Stat cards row */
-  .stat-grid {
-    display: grid;
-    grid-template-columns: repeat(6, 1fr);
-    gap: 1rem;
-  }
-
-  .stat-card {
-    background: var(--card-bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 1.2rem 1.4rem;
-    position: relative;
-    overflow: hidden;
-    transition: border-color 0.2s;
-  }
-
-  .stat-card::before {
-    content: '';
-    position: absolute;
-    top: 0; left: 0; right: 0;
-    height: 2px;
-    background: var(--accent);
-    opacity: 0.6;
-  }
-
-  .stat-card:nth-child(2)::before { background: var(--accent2); }
-  .stat-card:nth-child(3)::before { background: var(--warn); }
-  .stat-card:nth-child(4)::before { background: #00cfff; }
-  .stat-card:nth-child(5)::before { background: #ffcc00; }
-  .stat-card:nth-child(6)::before { background: #ff6b9d; }
-
-  .stat-card:hover { border-color: var(--accent); }
-
-  .stat-label {
-    font-size: 0.6rem;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: var(--muted);
-    margin-bottom: 0.6rem;
-  }
-
-  .stat-value {
-    font-family: 'Syne', sans-serif;
-    font-size: 1.8rem;
-    font-weight: 800;
-    color: var(--text);
-    line-height: 1;
-    margin-bottom: 0.3rem;
-  }
-
-  .stat-sub {
-    font-size: 0.65rem;
-    color: var(--muted);
-  }
-
-  /* Chart grid */
-  .chart-grid {
-    display: grid;
-    grid-template-columns: 2fr 1fr;
-    gap: 1rem;
-  }
-
-  .chart-grid-3 {
-    display: grid;
-    grid-template-columns: 1fr 1fr 1fr;
-    gap: 1rem;
-  }
-
-  .card {
-    background: var(--card-bg);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 1.5rem;
-  }
-
-  .card-title {
-    font-size: 0.65rem;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    color: var(--muted);
-    margin-bottom: 1.2rem;
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .card-title::before {
-    content: '//';
-    color: var(--accent);
-    font-weight: 700;
-  }
-
-  canvas { max-height: 220px; }
-
-  /* Query table */
-  .query-table {
-    width: 100%;
-    border-collapse: collapse;
-    font-size: 0.72rem;
-  }
-
-  .query-table th {
-    text-align: left;
-    padding: 0.5rem 0.8rem;
-    font-size: 0.6rem;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    color: var(--muted);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .query-table td {
-    padding: 0.6rem 0.8rem;
-    border-bottom: 1px solid rgba(30,30,46,0.6);
-    vertical-align: middle;
-  }
-
-  .query-table tr:hover td { background: rgba(0,255,157,0.03); }
-
-  .query-text {
-    max-width: 300px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text);
-  }
-
-  .badge {
-    display: inline-block;
-    padding: 0.15rem 0.5rem;
-    border-radius: 2px;
-    font-size: 0.6rem;
-    font-weight: 500;
-    letter-spacing: 0.05em;
-  }
-
-  .badge-mini { background: rgba(0,255,157,0.1); color: var(--accent); }
-  .badge-full { background: rgba(124,106,247,0.15); color: var(--accent2); }
-
-  .score-bar {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-  }
-
-  .score-track {
-    width: 60px; height: 3px;
-    background: var(--border);
-    border-radius: 2px;
-    overflow: hidden;
-  }
-
-  .score-fill {
-    height: 100%;
-    background: var(--accent);
-    border-radius: 2px;
-    transition: width 0.5s ease;
-  }
-
-  /* File list */
-  .file-list { display: flex; flex-direction: column; gap: 0.5rem; }
-
-  .file-row {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 0.5rem 0;
-    border-bottom: 1px solid rgba(30,30,46,0.5);
-    font-size: 0.72rem;
-    gap: 0.8rem;
-  }
-
-  .file-name {
-    color: var(--accent);
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    flex: 1;
-    font-size: 0.68rem;
-  }
-
-  .file-count {
-    color: var(--muted);
-    white-space: nowrap;
-    font-size: 0.65rem;
-  }
-
-  .file-bar-wrap {
-    width: 80px; height: 3px;
-    background: var(--border);
-    border-radius: 2px;
-    overflow: hidden;
-    flex-shrink: 0;
-  }
-
-  .file-bar-fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--accent2), var(--accent));
-    border-radius: 2px;
-  }
-
-  /* Loading */
-  .loading {
-    color: var(--muted);
-    font-size: 0.7rem;
-    text-align: center;
-    padding: 2rem;
-    animation: blink 1s infinite;
-  }
-
-  @keyframes blink {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0.3; }
-  }
-
-  /* Refresh button */
-  .refresh-btn {
-    background: transparent;
-    border: 1px solid var(--border);
-    color: var(--muted);
-    font-family: 'JetBrains Mono', monospace;
-    font-size: 0.65rem;
-    padding: 0.3rem 0.8rem;
-    border-radius: 2px;
-    cursor: pointer;
-    transition: all 0.2s;
-    letter-spacing: 0.08em;
-  }
-
-  .refresh-btn:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-  }
-
-  .empty { color: var(--muted); font-size: 0.72rem; text-align: center; padding: 2rem; }
-
-  @media (max-width: 1100px) {
-    .stat-grid { grid-template-columns: repeat(3, 1fr); }
-    .chart-grid { grid-template-columns: 1fr; }
-    .chart-grid-3 { grid-template-columns: 1fr; }
-  }
-</style>
-</head>
-<body>
-
-<header>
-  <div class="logo">
-    <div class="logo-dot"></div>
-    direction
-  </div>
-  <div class="header-meta">
-    <div>project analytics dashboard</div>
-    <div>last refresh: <span id="last-refresh">—</span></div>
-  </div>
-  <button class="refresh-btn" onclick="loadAll()">↻ refresh</button>
-</header>
-
-<main>
-
-  <!-- Stat Cards -->
-  <div class="stat-grid" id="stat-grid">
-    <div class="loading" style="grid-column:1/-1">loading...</div>
-  </div>
-
-  <!-- Charts row 1 -->
-  <div class="chart-grid">
-    <div class="card">
-      <div class="card-title">daily token usage</div>
-      <canvas id="tokenChart"></canvas>
-    </div>
-    <div class="card">
-      <div class="card-title">model distribution</div>
-      <canvas id="modelChart"></canvas>
-    </div>
-  </div>
-
-  <!-- Charts row 2 -->
-  <div class="chart-grid">
-    <div class="card">
-      <div class="card-title">token savings vs full context</div>
-      <canvas id="savingsChart"></canvas>
-    </div>
-    <div class="card">
-      <div class="card-title">top accessed files</div>
-      <div class="file-list" id="file-list">
-        <div class="loading">loading...</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Recent queries -->
-  <div class="card">
-    <div class="card-title">recent queries</div>
-    <div id="query-table-wrap">
-      <div class="loading">loading...</div>
-    </div>
-  </div>
-
-</main>
-
-<script>
-const API = '';
-let charts = {};
-
-const CHART_DEFAULTS = {
-  color: '#e2e2f0',
-  plugins: {
-    legend: { labels: { color: '#5a5a7a', font: { family: 'JetBrains Mono', size: 11 } } }
-  },
-  scales: {
-    x: { ticks: { color: '#5a5a7a', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e1e2e' } },
-    y: { ticks: { color: '#5a5a7a', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e1e2e' } }
-  }
-};
-  color: '#e2e2f0',
-  plugins: {
-    legend: { labels: { color: '#5a5a7a', font: { family: 'JetBrains Mono', size: 11 } } }
-  },
-  scales: {
-    x: { ticks: { color: '#5a5a7a', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e1e2e' } },
-    y: { ticks: { color: '#5a5a7a', font: { family: 'JetBrains Mono', size: 10 } }, grid: { color: '#1e1e2e' } }
-  }
-};
-
-function fmt(n, dec=0) {
-  if (n === null || n === undefined) return '—';
-  if (n >= 1_000_000) return (n/1_000_000).toFixed(1) + 'M';
-  if (n >= 1_000) return (n/1_000).toFixed(1) + 'K';
-  return Number(n).toFixed(dec);
-}
-
-function fmtCost(n) {
-  if (!n) return '$0.0000';
-  return '$' + Number(n).toFixed(4);
-}
-
-function fmtTime(n) {
-  if (!n) return '—';
-  return Number(n).toFixed(2) + 's';
-}
-
-async function fetchJSON(path) {
-  const r = await fetch(API + path);
-  return r.json();
-}
-
-async function loadSummary() {
-  const s = await fetchJSON('/api/summary');
-  const dbStats = await fetchJSON('/api/db-stats');
-
-  const cards = [
-    { label: 'total queries',     value: fmt(s.total_queries),          sub: 'all time' },
-    { label: 'tokens used',       value: fmt(s.total_tokens),           sub: 'input + output' },
-    { label: 'total cost',        value: fmtCost(s.total_cost),         sub: 'USD' },
-    { label: 'avg response',      value: fmtTime(s.avg_response_time),  sub: 'per query' },
-    { label: 'indexed chunks',    value: fmt(dbStats.total_chunks),     sub: `${fmt(dbStats.total_files)} files` },
-    { label: 'avg retrieval',     value: s.avg_retrieval_score ? (s.avg_retrieval_score * 100).toFixed(1) + '%' : '—', sub: 'relevance score' },
-  ];
-
-  document.getElementById('stat-grid').innerHTML = cards.map(c => `
-    <div class="stat-card">
-      <div class="stat-label">${c.label}</div>
-      <div class="stat-value">${c.value}</div>
-      <div class="stat-sub">${c.sub}</div>
-    </div>
-  `).join('');
-}
-
-async function loadTokenChart() {
-  const data = await fetchJSON('/api/daily?days=30');
-  if (charts.token) charts.token.destroy();
-
-  const ctx = document.getElementById('tokenChart').getContext('2d');
-  charts.token = new Chart(ctx, {
-    type: 'bar',
-    data: {
-      labels: data.map(d => d.date.slice(5)),
-      datasets: [
-        {
-          label: 'tokens used',
-          data: data.map(d => d.total_tokens),
-          backgroundColor: 'rgba(0,255,157,0.2)',
-          borderColor: '#00ff9d',
-          borderWidth: 1,
-        },
-        {
-          label: 'tokens saved',
-          data: data.map(d => d.total_tokens_saved),
-          backgroundColor: 'rgba(124,106,247,0.2)',
-          borderColor: '#7c6af7',
-          borderWidth: 1,
-        }
-      ]
-    },
-    options: {
-      ...CHART_DEFAULTS,
-      responsive: true,
-      plugins: { ...CHART_DEFAULTS.plugins },
-      scales: CHART_DEFAULTS.scales
-    }
-  });
-}
-
-async function loadModelChart() {
-  const data = await fetchJSON('/api/models');
-  if (charts.model) charts.model.destroy();
-
-  if (!data.length) {
-    document.getElementById('modelChart').parentElement.innerHTML += '<div class="empty">no data yet</div>';
-    return;
-  }
-
-  const ctx = document.getElementById('modelChart').getContext('2d');
-  charts.model = new Chart(ctx, {
-    type: 'doughnut',
-    data: {
-      labels: data.map(d => d.model),
-      datasets: [{
-        data: data.map(d => d.total_queries),
-        backgroundColor: ['rgba(0,255,157,0.7)', 'rgba(124,106,247,0.7)', 'rgba(255,107,53,0.7)'],
-        borderColor: '#0a0a0f',
-        borderWidth: 3
-      }]
-    },
-    options: {
-      responsive: true,
-      plugins: {
-        legend: { position: 'bottom', labels: { color: '#5a5a7a', font: { family: 'JetBrains Mono', size: 10 }, padding: 16 } }
-      }
-    }
-  });
-}
-
-async function loadSavingsChart() {
-  const data = await fetchJSON('/api/savings?days=30');
-  if (charts.savings) charts.savings.destroy();
-
-  const ctx = document.getElementById('savingsChart').getContext('2d');
-  charts.savings = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels: data.map(d => d.date.slice(5)),
-      datasets: [{
-        label: 'savings %',
-        data: data.map(d => d.savings_pct),
-        borderColor: '#00ff9d',
-        backgroundColor: 'rgba(0,255,157,0.05)',
-        borderWidth: 2,
-        pointRadius: 3,
-        pointBackgroundColor: '#00ff9d',
-        tension: 0.4,
-        fill: true
-      }]
-    },
-    options: {
-      ...CHART_DEFAULTS,
-      responsive: true,
-      plugins: { ...CHART_DEFAULTS.plugins },
-      scales: {
-        ...CHART_DEFAULTS.scales,
-        y: {
-          ...CHART_DEFAULTS.scales.y,
-          min: 0, max: 100,
-          ticks: { ...CHART_DEFAULTS.scales.y.ticks, callback: v => v + '%' }
-        }
-      }
-    }
-  });
-}
-
-async function loadFiles() {
-  const data = await fetchJSON('/api/files?limit=10');
-  const el = document.getElementById('file-list');
-
-  if (!data.length) {
-    el.innerHTML = '<div class="empty">no file access data yet</div>';
-    return;
-  }
-
-  const max = data[0].access_count;
-  el.innerHTML = data.map(f => `
-    <div class="file-row">
-      <div class="file-name">${f.file_path}</div>
-      <div class="file-bar-wrap">
-        <div class="file-bar-fill" style="width:${(f.access_count/max*100).toFixed(0)}%"></div>
-      </div>
-      <div class="file-count">${f.access_count}x</div>
-    </div>
-  `).join('');
-}
-
-async function loadQueries() {
-  const data = await fetchJSON('/api/queries?limit=20');
-  const wrap = document.getElementById('query-table-wrap');
-
-  if (!data.length) {
-    wrap.innerHTML = '<div class="empty">no queries yet — run `direction query` to get started</div>';
-    return;
-  }
-
-  wrap.innerHTML = `
-    <table class="query-table">
-      <thead>
-        <tr>
-          <th>question</th>
-          <th>model</th>
-          <th>tokens</th>
-          <th>cost</th>
-          <th>time</th>
-          <th>retrieval</th>
-          <th>saved</th>
-          <th>timestamp</th>
-        </tr>
-      </thead>
-      <tbody>
-        ${data.map(q => `
-          <tr>
-            <td><div class="query-text" title="${q.question}">${q.question}</div></td>
-            <td>
-              <span class="badge ${q.model.includes('mini') ? 'badge-mini' : 'badge-full'}">
-                ${q.model.includes('mini') ? 'mini' : '4o'}
-              </span>
-            </td>
-            <td>${fmt(q.total_tokens)}</td>
-            <td>${fmtCost(q.cost)}</td>
-            <td>${fmtTime(q.response_time)}</td>
-            <td>
-              <div class="score-bar">
-                <div class="score-track">
-                  <div class="score-fill" style="width:${(q.retrieval_score*100).toFixed(0)}%"></div>
-                </div>
-                <span style="font-size:0.65rem;color:var(--muted)">${(q.retrieval_score*100).toFixed(0)}%</span>
-              </div>
-            </td>
-            <td style="color:var(--accent)">${fmt(q.tokens_saved)}</td>
-            <td style="color:var(--muted);font-size:0.65rem">${q.timestamp.slice(0,16).replace('T',' ')}</td>
-          </tr>
-        `).join('')}
-      </tbody>
-    </table>
-  `;
-}
-
-async function loadAll() {
-  document.getElementById('last-refresh').textContent = new Date().toLocaleTimeString();
-  await Promise.all([
-    loadSummary(),
-    loadTokenChart(),
-    loadModelChart(),
-    loadSavingsChart(),
-    loadFiles(),
-    loadQueries()
-  ]);
-}
-
-// Auto-refresh every 30 seconds
-loadAll();
-setInterval(loadAll, 30_000);
-</script>
-</body>
-</html>"""
-
-
-@app.get("/", response_class=HTMLResponse)
-def dashboard():
-    return HTMLResponse(content=DASHBOARD_HTML)
+@app.get("/api/analytics")
+def api_analytics():
+    try:
+        from votor.analytics import get_summary, get_recent_queries
+        summary = get_summary()
+        queries = get_recent_queries(limit=200)
+        return {**summary, "queries": queries}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/status")
+def api_status():
+    try:
+        from votor.db import get_stats
+        from votor.analytics import get_summary
+        stats   = get_stats()
+        summary = get_summary()
+        # Build files list with chunk counts
+        files = [{"path": f, "chunks": 0, "indexed_at": ""} for f in stats.get("files", [])]
+        return {**stats, **summary, "files": files}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/history")
+def api_history():
+    try:
+        from votor.tools import git_log
+        return git_log()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/diff/{n}")
+def api_diff(n: int):
+    try:
+        from votor.tools import git_diff
+        return git_diff(n)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/undo")
+def api_undo():
+    try:
+        from votor.tools import git_undo
+        return git_undo()
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/revert/{n}")
+def api_revert(n: int):
+    try:
+        from votor.tools import git_revert_to
+        return git_revert_to(n)
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/config")
+def api_get_config():
+    try:
+        if CONFIG_FILE.exists():
+            with open(CONFIG_FILE) as f:
+                return json.load(f)
+        return {}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/config")
+async def api_save_config(request):
+    try:
+        from fastapi import Request
+        body = await request.json()
+        with open(CONFIG_FILE, "w") as f:
+            json.dump(body, f, indent=2)
+        broadcast_sync({"type": "config_saved", "config": body})
+        return {"success": True}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.post("/api/side-chat")
+async def api_side_chat(request):
+    try:
+        body      = await request.json()
+        text      = body.get("text", "")
+        provider  = body.get("provider", "openai")
+        model     = body.get("model", "gpt-4o-mini")
+        api_key   = body.get("api_key", "")
+
+        from votor.providers import call_llm
+        import os
+        if api_key:
+            # Temporarily set key for this call
+            env_key_map = {
+                "openai":    "OPENAI_API_KEY",
+                "anthropic": "ANTHROPIC_API_KEY",
+                "groq":      "GROQ_API_KEY",
+            }
+            env_key = env_key_map.get(provider)
+            if env_key:
+                os.environ[env_key] = api_key
+
+        result = call_llm(provider, model, [{"role": "user", "content": text}])
+        return {"content": result["content"]}
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+# ---------------------------------------------------------------------------
+# Static files + root
+# ---------------------------------------------------------------------------
+
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+
+@app.get("/")
+def root():
+    index = STATIC_DIR / "index.html"
+    if index.exists():
+        return FileResponse(str(index), headers={"Cache-Control": "no-store"})
+    return JSONResponse({"error": "Dashboard frontend not found. Add votor/static/index.html."})
+
+
+# ---------------------------------------------------------------------------
+# Server launcher
+# ---------------------------------------------------------------------------
+
+_server_thread: threading.Thread | None = None
+_server_url: str | None = None
+_server_lock = threading.Lock()
+
+
+def start_dashboard(port: int = 8000, open_browser: bool = False) -> str:
+    """
+    Start the dashboard server in a background daemon thread.
+    Returns the URL. Safe to call multiple times — only starts once.
+    """
+    global _server_thread, _server_url
+
+    with _server_lock:
+        if _server_thread is not None and _server_thread.is_alive():
+            return _server_url
+
+        url = f"http://127.0.0.1:{port}"
+        _server_url = url
+
+        config = uvicorn.Config(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_level="error",
+            access_log=False,
+            loop="asyncio",
+        )
+        server = uvicorn.Server(config)
+
+        _server_thread = threading.Thread(target=server.run, daemon=True)
+        _server_thread.start()
+
+    if open_browser:
+        import time
+        time.sleep(1.5)  # give server a moment to start
+        webbrowser.open(url)
+
+    return url
