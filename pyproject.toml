@@ -7,7 +7,7 @@ name = "votor"
 version = "0.1.0"
 description = "Project-aware coding assistant powered by vector search"
 requires-python = ">=3.10"
-keywords = ["ai", "vector", "coding", "assistant", "chromadb", "openai", "anthropic"]
+keywords = ["ai", "vector", "coding", "assistant", "qdrant", "ollama", "openai", "anthropic"]
 license = { text = "MIT" }
 classifiers = [
     "Programming Language :: Python :: 3",

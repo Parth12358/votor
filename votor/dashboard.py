@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import threading
 import webbrowser
 from contextlib import asynccontextmanager
@@ -35,7 +36,8 @@ CONFIG_FILE  = Path(".vectormind/config.json")
 
 # Connected dashboard WebSocket clients
 _ws_clients: list[WebSocket] = []
-_ws_lock = threading.Lock()
+_ws_lock     = threading.Lock()
+_query_lock  = threading.Lock()  # prevents concurrent terminal + dashboard queries
 
 
 # ---------------------------------------------------------------------------
@@ -106,6 +108,35 @@ async def _handle_ws_message(ws: WebSocket, data: dict):
         t.start()
 
 
+_MARKUP_RE = re.compile(r'\[/?[^\]]*\]')
+
+
+class _BroadcastConsole:
+    """
+    Wraps qmod.console so that every console.print() call:
+      1. Passes through to the real terminal console (unchanged).
+      2. Strips Rich markup and broadcasts a `log` event to the browser.
+    Non-string objects (Panel, Markdown, Progress) are passed through only —
+    they are never broadcast.
+    """
+    def __init__(self, real):
+        self._real = real
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+    def print(self, *args, **kwargs):
+        self._real.print(*args, **kwargs)
+        text_parts = [a for a in args if isinstance(a, str)]
+        if text_parts:
+            plain = _MARKUP_RE.sub('', ' '.join(text_parts)).strip()
+            if plain:
+                broadcast_sync({"type": "log", "html": plain})
+
+    def status(self, *args, **kwargs):
+        return self._real.status(*args, **kwargs)
+
+
 def _run_query_from_dashboard(data: dict):
     """Run a votor query triggered from the dashboard."""
     from rich.console import Console as RichConsole
@@ -118,12 +149,18 @@ def _run_query_from_dashboard(data: dict):
     show_sources  = data.get("show_sources", False)
     show_thinking = data.get("show_thinking", False)
 
+    if not _query_lock.acquire(blocking=False):
+        broadcast_sync({"type": "error", "message": "A query is already running — please wait."})
+        return
+
     broadcast_sync({"type": "input_received", "source": "dashboard", "text": question})
     _term = RichConsole()
     _term.print(f"\n  [#5c6370]dashboard[/#5c6370] [#61afef]❯[/#61afef] [#abb2bf]{question}[/#abb2bf]")
     broadcast_sync({"type": "busy", "busy": True})
 
+    original_console = qmod.console
     try:
+        qmod.console = _BroadcastConsole(original_console)
         _set_headless(True)  # silence streamed answer text in _stream_to_console
         result = run_query(
             question,
@@ -176,7 +213,9 @@ def _run_query_from_dashboard(data: dict):
         _term.print(f"  [#e06c75]✗ dashboard query failed: {e}[/#e06c75]\n")
         broadcast_sync({"type": "error", "message": str(e)})
     finally:
+        qmod.console = original_console
         _set_headless(False)
+        _query_lock.release()
         try:
             broadcast_sync({"type": "busy", "busy": False})
         except Exception:
@@ -186,8 +225,12 @@ def _run_query_from_dashboard(data: dict):
 def _run_index(force: bool):
     """Run index triggered from dashboard."""
     from votor.indexer import index_project
+
+    def _on_progress(current, total, file):
+        broadcast_sync({"type": "index_progress", "current": current, "total": total, "file": file})
+
     try:
-        stats = index_project(incremental=not force, force=force)
+        stats = index_project(incremental=not force, force=force, on_progress=_on_progress)
         broadcast_sync({
             "type":   "index_complete",
             "files":  stats.get("files", 0),

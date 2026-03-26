@@ -841,7 +841,7 @@ async function loadAnalytics(){
     document.getElementById('s-r').textContent=`${(d.avg_response_time||0).toFixed(2)}s`;
     const L={paper_bgcolor:'transparent',plot_bgcolor:'transparent',margin:{t:4,r:8,b:28,l:36},font:{color:'#5c6370',family:'JetBrains Mono',size:10},xaxis:{gridcolor:'#1a1a2e',linecolor:'#1a1a2e'},yaxis:{gridcolor:'#1a1a2e',linecolor:'#1a1a2e'}};
     const C={displayModeBar:false,responsive:true};
-    const qs=d.queries||[];const ts=qs.map(q=>q.created_at);
+    const qs=d.queries||[];const ts=qs.map(q=>q.timestamp);
     Plotly.newPlot('c-q',[{x:ts,type:'histogram',marker:{color:'#00ffaa',opacity:.7},nbinsx:20}],{...L},C);
     Plotly.newPlot('c-t',[{x:ts,y:qs.map(q=>q.total_tokens),type:'scatter',mode:'lines+markers',line:{color:'#61afef',width:1.5},marker:{color:'#61afef',size:4}}],{...L},C);
     Plotly.newPlot('c-c',[{x:ts,y:qs.map(q=>q.cost),type:'scatter',mode:'lines+markers',line:{color:'#e5c07b',width:1.5},marker:{color:'#e5c07b',size:4}}],{...L},C);

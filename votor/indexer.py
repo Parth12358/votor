@@ -96,7 +96,8 @@ def index_project(
     root: str = ".",
     config: dict = None,
     incremental: bool = True,
-    force: bool = False
+    force: bool = False,
+    on_progress=None,
 ) -> dict:
     """
     Crawl project, chunk files, embed, and store in Qdrant.
@@ -146,7 +147,7 @@ def index_project(
     ) as progress:
         task = progress.add_task("Indexing...", total=len(files))
 
-        for filepath in files:
+        for idx, filepath in enumerate(files):
             try:
                 rel_path     = str(filepath.relative_to(Path(root).resolve()))
                 current_hash = get_file_hash(filepath)
@@ -216,6 +217,8 @@ def index_project(
 
             finally:
                 progress.advance(task)
+                if on_progress:
+                    on_progress(idx + 1, len(files), filepath.name)
 
     # Save hashes
     if force:
