@@ -32,6 +32,7 @@
 | Dashboard busy lock | `_query_lock` prevents terminal and dashboard from running concurrent queries — second request gets an error event immediately |
 | Dashboard index progress | `index_project()` accepts `on_progress` callback; `_run_index` passes a lambda that emits `index_progress` events — browser progress bar now advances during indexing |
 | Dashboard analytics fix | Frontend read `q.created_at` but DB column is `timestamp` — fixed to `q.timestamp`, Plotly charts now receive real data |
+| Dashboard markdown rendering | `marked.js` added to browser UI; streaming tokens accumulated in `S.curRaw`, rendered via `marked.parse()` on `query_complete`; streaming shows single replacing `.stream-raw` span, finalize swaps it for rendered HTML |
 
 ---
 
@@ -75,6 +76,7 @@ Backend fully rewritten and working. Terminal parity complete. Browser receives 
 
 **Streaming tokens to browser**
 Queries complete and the answer appears at once via `query_complete.answer`. Token-by-token streaming requires `_stream_to_console` to emit `{"type": "token", "content": chunk}` broadcasts when `_is_headless()`. Small change to `query.py` — import and call `broadcast_sync` from within the headless stream-consume loop.
+> Markdown rendering of the final answer is now working — `marked.js` renders `S.curRaw` on `query_complete`.
 
 **Edit mode progress in browser**
 Edit mode runs entirely in the terminal — `step_progress`, `diff`, and commit events are never broadcast. Requires emitting these from `run_edit_mode()` in `query.py`. Medium scope.
@@ -221,7 +223,7 @@ votor/
 | Item | Effort | Priority | Status |
 |---|---|---|---|
 | 0 UI/UX redesign | Large | High — affects every interaction | Partial — edit mode progress bar done |
-| 0b Dashboard | Large | High — browser gaps remain | Partial — streaming + edit mode progress open |
+| 0b Dashboard | Large | High — browser gaps remain | Partial — markdown ✓, streaming + edit mode progress open |
 | 1a egg-info exclude | Trivial | — | ✓ Done |
 | 1b pyproject keywords | Trivial | — | ✓ Done |
 | 1c Qdrant concurrent access | Small | — | ✓ Done |

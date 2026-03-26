@@ -7,6 +7,7 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;600&family=Inter:wght@300;400;500&display=swap" rel="stylesheet">
 <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
 <style>
 :root {
   --bg:#080810; --bg2:#0d0d1a; --bg3:#111120;
@@ -308,6 +309,23 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
   .bubble{max-width:960px}
   #side-chat.open{width:320px;min-width:320px}
 }
+.bubble.asst h1,.bubble.asst h2,.bubble.asst h3{font-family:var(--mono);color:var(--text);margin:10px 0 4px;font-size:13px;font-weight:600;border-bottom:1px solid var(--border);padding-bottom:4px}
+.bubble.asst h4,.bubble.asst h5{font-family:var(--mono);color:var(--muted);margin:8px 0 2px;font-size:12px;font-weight:500}
+.bubble.asst p{margin:4px 0;line-height:1.65}
+.bubble.asst ul,.bubble.asst ol{padding-left:20px;margin:4px 0}
+.bubble.asst li{margin:2px 0;line-height:1.6}
+.bubble.asst code{font-family:var(--mono);font-size:11px;background:var(--bg3);border:1px solid var(--border2);padding:1px 5px;border-radius:3px;color:var(--green)}
+.bubble.asst pre{background:var(--bg3);border:1px solid var(--border2);border-radius:var(--r);padding:10px 12px;margin:6px 0;overflow-x:auto}
+.bubble.asst pre code{background:transparent;border:none;padding:0;color:var(--muted);font-size:11px}
+.bubble.asst strong{color:var(--text);font-weight:600}
+.bubble.asst em{color:var(--muted)}
+.bubble.asst blockquote{border-left:2px solid var(--green);margin:6px 0;padding:2px 10px;color:var(--dim)}
+.bubble.asst table{border-collapse:collapse;width:100%;margin:6px 0;font-size:11px}
+.bubble.asst th{font-family:var(--mono);font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.5px;padding:4px 8px;border-bottom:1px solid var(--border2);text-align:left}
+.bubble.asst td{padding:4px 8px;border-bottom:1px solid var(--border);color:var(--muted)}
+.bubble.asst hr{border:none;border-top:1px solid var(--border);margin:8px 0}
+.bubble.asst a{color:var(--blue);text-decoration:none}
+.bubble.asst a:hover{text-decoration:underline}
 </style>
 </head>
 <body>
@@ -604,7 +622,9 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
 <div id="toasts"></div>
 
 <script>
-const S={panel:'chat',busy:false,src:false,think:false,ws:null,ready:false,cfg:{},curBubble:null,curFoot:null};
+// Configure markdown renderer (marked v5+ removed headerIds/mangle)
+marked.use({ breaks: true, gfm: true });
+const S={panel:'chat',busy:false,src:false,think:false,ws:null,ready:false,cfg:{},curBubble:null,curFoot:null,curRaw:''};
 
 // ── WebSocket ───────────────────────────────────────────
 function connectWS() {
@@ -696,12 +716,18 @@ function addLog(html){ap(mk(`<div class="bubble log">${html}</div>`));}
 function startAsstBubble(){
   const bid='b'+Date.now(),fid='f'+Date.now();
   ap(mk(`<div class="msg-src"><span class="badge votor">votor</span></div><div class="bubble asst" id="${bid}"><span class="cursor"></span></div><div class="msg-foot" id="${fid}" style="display:none"></div>`));
-  S.curBubble=document.getElementById(bid);S.curFoot=document.getElementById(fid);
+  S.curBubble=document.getElementById(bid);S.curFoot=document.getElementById(fid);S.curRaw='';
 }
 function appendTok(tok,think){
   if(!S.curBubble)startAsstBubble();
+  S.curRaw+=tok;
   S.curBubble.querySelector('.cursor')?.remove();
-  const s=document.createElement('span');if(think)s.style.color='var(--dim)';s.textContent=tok;
+  const s=document.createElement('span');
+  if(think)s.style.color='var(--dim)';
+  s.textContent=S.curRaw;
+  s.className='stream-raw';
+  const existing=S.curBubble.querySelector('.stream-raw');
+  if(existing)existing.remove();
   S.curBubble.appendChild(s);
   const c=document.createElement('span');c.className='cursor';S.curBubble.appendChild(c);
   scrollChat();
@@ -724,16 +750,33 @@ function finalMsg(ev){
   if(!S.curBubble && ev.answer){
     startAsstBubble();
     S.curBubble.querySelector('.cursor')?.remove();
-    const s=document.createElement('span');
-    s.textContent=ev.answer;
-    S.curBubble.appendChild(s);
+    try{ S.curBubble.innerHTML = marked.parse(ev.answer); }catch(e){ S.curBubble.textContent = ev.answer; }
   }
-  S.curBubble?.querySelector('.cursor')?.remove();
-  S.curBubble=null;
+  if(S.curBubble){
+    S.curBubble.querySelector('.cursor')?.remove();
+    S.curBubble.querySelector('.stream-raw')?.remove();
+    const raw = S.curRaw || '';
+    if(raw.trim()){
+      try{ S.curBubble.innerHTML = marked.parse(raw); }catch(e){ S.curBubble.textContent = raw; }
+    }
+    S.curBubble=null;S.curRaw='';
+  }
   if(S.curFoot&&ev.tokens!=null){
     S.curFoot.style.display='flex';
     S.curFoot.innerHTML=`<span><span class="vy">${(ev.tokens||0).toLocaleString()}</span> tokens</span><span><span class="vy">$${(ev.cost||0).toFixed(4)}</span></span><span>total <span class="v">${ev.response_time||0}s</span></span><span><span class="vp">${ev.model||''}</span></span><span><span class="v">${Math.round((ev.retrieval_score||0)*100)}%</span> retrieval</span>`;
     S.curFoot=null;
+  }
+  if(ev.sources&&ev.sources.length){
+    const seen=new Set();
+    let h='<div style="margin:2px 0 8px 0;padding:6px 10px;border-left:2px solid var(--border);font-size:10px;color:var(--dim)"><div style="margin-bottom:4px;text-transform:uppercase;letter-spacing:1px;font-size:9px">sources</div>';
+    for(const src of ev.sources){
+      if(seen.has(src.file))continue;
+      seen.add(src.file);
+      const pct=Math.round((src.score||0)*100);
+      h+=`<div style="display:flex;gap:8px;align-items:baseline;padding:1px 0"><span style="color:var(--blue);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:320px">${esc(src.file)}</span><span style="color:var(--dim);flex-shrink:0">${pct}%</span></div>`;
+    }
+    h+='</div>';
+    ap(mk(h));
   }
 }
 function mk(html){const d=document.createElement('div');d.className='msg-row';d.innerHTML=html;return d;}

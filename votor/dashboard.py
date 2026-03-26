@@ -206,6 +206,7 @@ def _run_query_from_dashboard(data: dict):
             "model":           result.get("model", ""),
             "retrieval_score": result.get("retrieval_score", 0),
             "answer":          result.get("answer", ""),
+            "sources":         result.get("sources", []) if show_sources else [],
         })
     except Exception as e:
         import traceback
