@@ -439,6 +439,9 @@ def start_dashboard(port: int = 8000, open_browser: bool = False) -> str:
         _server_thread = threading.Thread(target=server.run, daemon=True)
         _server_thread.start()
 
+        import votor.events as _events
+        _events.register(broadcast_sync)
+
     if open_browser:
         import time
         time.sleep(1.5)  # give server a moment to start

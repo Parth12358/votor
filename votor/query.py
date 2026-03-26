@@ -741,6 +741,7 @@ def run_edit_mode(
     ) as progress:
         task = progress.add_task("starting...", total=total_steps)
 
+        from votor.events import broadcast as _broadcast
         for i, step in enumerate(write_plan):
             action = step.get("action")
             file   = step.get("file", "")
@@ -753,6 +754,7 @@ def run_edit_mode(
 
             # Update bar description
             progress.update(task, description=f"[#e5c07b]{action}[/#e5c07b] [#61afef]{file}[/#61afef]")
+            _broadcast({"type": "step_progress", "current": i + 1, "total": total_steps, "action": action, "file": file})
 
             # Guard — never allow modifications to .vectormind
             if ".vectormind" in file:
@@ -781,6 +783,7 @@ def run_edit_mode(
                     progress.stop()
                     show_diff(result["diff_preview"], title=f"edit — {file}")
                     progress.start()
+                    _broadcast({"type": "diff", "title": f"edit — {file}", "diff": result["diff_preview"]})
 
             elif action == "create":
                 result = dispatch_tool("create_file", {
@@ -804,6 +807,7 @@ def run_edit_mode(
                         progress.stop()
                         show_diff(result["diff_preview"], title=f"create (replaced) — {file}")
                         progress.start()
+                        _broadcast({"type": "diff", "title": f"create (replaced) — {file}", "diff": result["diff_preview"]})
 
             elif action == "delete":
                 if file in protected_files:
@@ -1008,10 +1012,11 @@ def _stream_to_console(stream_gen, show_thinking: bool = False) -> dict:
     full_content = ""
 
     if _is_headless():
-        # Consume stream silently — no console interaction
+        from votor.events import broadcast
         for chunk in stream_gen:
             if isinstance(chunk, str):
                 full_content += chunk
+                broadcast({"type": "token", "token": chunk})
             else:
                 result = chunk
         if full_content and not result.get("content"):

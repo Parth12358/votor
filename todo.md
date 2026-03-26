@@ -33,6 +33,8 @@
 | Dashboard index progress | `index_project()` accepts `on_progress` callback; `_run_index` passes a lambda that emits `index_progress` events — browser progress bar now advances during indexing |
 | Dashboard analytics fix | Frontend read `q.created_at` but DB column is `timestamp` — fixed to `q.timestamp`, Plotly charts now receive real data |
 | Dashboard markdown rendering | `marked.js` added to browser UI; streaming tokens accumulated in `S.curRaw`, rendered via `marked.parse()` on `query_complete`; streaming shows single replacing `.stream-raw` span, finalize swaps it for rendered HTML |
+| Dashboard streaming tokens | `votor/events.py` shim added; `broadcast_sync` registered at dashboard startup; `_stream_to_console` headless branch broadcasts `{"type":"token","token":chunk}` per chunk |
+| Dashboard edit mode progress | `run_edit_mode` broadcasts `step_progress` before each step and `diff` after each successful edit/create; commit line already forwarded via `_BroadcastConsole` |
 
 ---
 
@@ -83,6 +85,134 @@ Edit mode runs entirely in the terminal — `step_progress`, `diff`, and commit 
 
 **Terminal mirror panel**
 The browser has a terminal mirror strip that expects `terminal_output` events. Nothing emits them. Deferred to event bus refactor.
+
+---
+
+### 0b Implementation Plan
+
+#### Step 1 — Streaming tokens (`query.py`, small)
+
+`_stream_to_console()` currently consumes the stream silently when `_is_headless()`. Change the headless branch to broadcast each chunk as a `token` event:
+
+```python
+# query.py — _stream_to_console(), headless branch
+from votor.dashboard import broadcast_sync   # add at top of file
+
+if _is_headless():
+    for chunk in stream_gen:
+        if isinstance(chunk, str):
+            full_content += chunk
+            broadcast_sync({"type": "token", "token": chunk})   # ← add
+        else:
+            result = chunk
+    ...
+```
+
+Frontend already handles `token` events via `appendTok`. No frontend changes needed.
+
+> **Circular import risk:** `query.py` is imported by `dashboard.py`. Fix: move `broadcast_sync` import inside the function body, or expose it via a thin `events.py` shim (no-op when dashboard is not running).
+
+---
+
+#### Step 2 — Edit mode progress (`query.py`, medium)
+
+`run_edit_mode()` drives a Rich progress bar and calls `console.print` for diffs and commits. `_BroadcastConsole` already forwards `console.print` as `log` events, so text lines arrive in the browser. What's missing: structured `step_progress` and `diff` events for the browser's progress bar and diff viewer.
+
+**2a — step_progress events**
+
+In the step-execution loop (around line 755), after updating the progress bar description, add:
+
+```python
+broadcast_sync({
+    "type": "step_progress",
+    "current": step_idx + 1,
+    "total": len(steps),
+    "action": action,
+    "file": file_path,
+})
+```
+
+Frontend's `appendStep()` already renders these as a progress bar. No frontend changes needed.
+
+**2b — diff events**
+
+After `show_diff()` calls (lines 780-783, 803-806), add:
+
+```python
+broadcast_sync({
+    "type": "diff",
+    "title": f"{action}: {file_path}",
+    "diff": diff_text,
+})
+```
+
+Frontend's `appendDiff()` already renders these. No frontend changes needed.
+
+**2c — commit event**
+
+After the commit line (line 865), add:
+
+```python
+broadcast_sync({
+    "type": "log",
+    "html": f'<span class="g">✓ committed {n} file(s)</span>',
+})
+```
+
+Already handled by `log` events — no new event type needed.
+
+---
+
+#### Step 3 — Circular import fix (`events.py`, small)
+
+Create `votor/events.py` as a thin shim so `query.py` never imports from `dashboard.py` directly:
+
+```python
+# votor/events.py
+_broadcast_fn = None
+
+def register(fn):
+    global _broadcast_fn
+    _broadcast_fn = fn
+
+def broadcast(event: dict):
+    if _broadcast_fn:
+        _broadcast_fn(event)
+```
+
+In `dashboard.py` startup:
+
+```python
+import votor.events as _events
+_events.register(broadcast_sync)
+```
+
+In `query.py`:
+
+```python
+from votor.events import broadcast
+# replace broadcast_sync(...) calls with broadcast(...)
+```
+
+When running from the REPL (no dashboard), `_broadcast_fn` is `None` and all calls are no-ops.
+
+---
+
+#### Step 4 — Terminal mirror panel (deferred)
+
+The browser has a terminal mirror strip expecting `terminal_output` events. Requires the full event bus (item 1) to capture REPL-initiated terminal output. Defer until Step 3's `events.py` shim is in place and proven.
+
+---
+
+#### Effort summary
+
+| Sub-task | File(s) | Effort |
+|---|---|---|
+| Streaming tokens | `query.py` | 1–2 hours |
+| Circular import shim | `events.py`, `dashboard.py`, `query.py` | 1 hour |
+| step_progress events | `query.py` | 1 hour |
+| diff events | `query.py` | 1 hour |
+| Terminal mirror | deferred | — |
 
 ---
 
@@ -223,7 +353,7 @@ votor/
 | Item | Effort | Priority | Status |
 |---|---|---|---|
 | 0 UI/UX redesign | Large | High — affects every interaction | Partial — edit mode progress bar done |
-| 0b Dashboard | Large | High — browser gaps remain | Partial — markdown ✓, streaming + edit mode progress open |
+| 0b Dashboard | Large | High — browser gaps remain | Partial — markdown ✓, streaming ✓, edit mode progress ✓, terminal mirror open |
 | 1a egg-info exclude | Trivial | — | ✓ Done |
 | 1b pyproject keywords | Trivial | — | ✓ Done |
 | 1c Qdrant concurrent access | Small | — | ✓ Done |
