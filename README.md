@@ -134,3 +134,25 @@ ollama pull nomic-embed-text
 - Python 3.10+
 - Git
 - Ollama (optional, for local models) or at least one API key
+
+---
+
+## Roadmap
+
+| Item | Effort | Priority | Status |
+|---|---|---|---|
+| 0 UI/UX redesign | Large | High | ✓ Done |
+| 0b Dashboard | Large | High | ✓ Done |
+| 1a egg-info exclude | Trivial | — | ✓ Done |
+| 1b pyproject keywords | Trivial | — | ✓ Done |
+| 1c Qdrant concurrent access | Small | — | ✓ Done |
+| 1d debug print cleanup | Trivial | — | ✓ Done |
+| 5 Multi-file edit support | Medium | High | ✓ Done |
+| 1 Event bus (full mirroring) | Large | Medium | Open |
+| 2 Reason mode | Medium | Medium | Open |
+| 4 Conversation memory | Medium | Medium | Open |
+| 6 Step mode | Medium | High | Open |
+| 7 Watch mode | Small | Low | Open |
+| 8 Parallel client support | Medium | Low | Open |
+| 9 File tree | Medium | Low | Open |
+| 3 Chunk rewrite (Option B) | Large | Low | Shelved |

@@ -234,20 +234,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
 .danger-btn{font-family:var(--mono);font-size:11px;padding:6px 14px;border-radius:3px;border:1px solid var(--red);background:transparent;color:var(--red);cursor:pointer;transition:all .15s}
 .danger-btn:hover{background:var(--red);color:var(--bg)}
 
-/* ── Terminal mirror ── */
-#term-wrap{border-top:1px solid var(--border);background:var(--bg);flex-shrink:0;display:flex;flex-direction:column;height:160px;transition:height .2s}
-#term-wrap.collapsed{height:28px}
-#term-hdr{display:flex;align-items:center;justify-content:space-between;padding:5px 14px;border-bottom:1px solid var(--border);cursor:pointer;user-select:none;flex-shrink:0}
-#term-hdr-left{display:flex;align-items:center;gap:8px}
-.term-title{font-family:var(--mono);font-size:10px;color:var(--dim);letter-spacing:.5px;text-transform:uppercase}
-.term-dot-live{width:5px;height:5px;border-radius:50%;background:var(--green);box-shadow:0 0 4px var(--green);animation:pulse 2s infinite}
-.term-chevron{font-size:10px;color:var(--dim);transition:transform .2s}
-#term-wrap.collapsed .term-chevron{transform:rotate(180deg)}
-#term-out{flex:1;overflow-y:auto;padding:8px 14px;font-family:var(--mono);font-size:11px;line-height:1.6;color:var(--dim)}
-#term-out::-webkit-scrollbar{width:3px}
-#term-out::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
-.tl{display:block;white-space:pre-wrap;word-break:break-all}
-.tl.tg{color:var(--green)}.tl.tb{color:var(--blue)}.tl.tp{color:var(--purple)}.tl.ty{color:var(--yellow)}.tl.tr{color:var(--red)}.tl.tw{color:var(--muted)}
 
 ::-webkit-scrollbar{width:4px;height:4px}
 ::-webkit-scrollbar-thumb{background:var(--border2);border-radius:2px}
@@ -292,7 +278,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
   .idx-actions{flex-wrap:wrap}
   .idx-btn{flex:1;justify-content:center}
   #side-chat.open{position:fixed;top:0;right:0;bottom:0;width:100%!important;min-width:100%!important;z-index:51}
-  #term-wrap{height:120px}
   .h-item{grid-template-columns:24px 56px 1fr}
   .h-hash,.h-btns,.h-time,.h-act{display:none}
   .msg-foot{gap:8px;font-size:9px}
@@ -394,17 +379,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
         <textarea id="chat-inp" placeholder="ask a question or describe an edit..." rows="1"></textarea>
         <button id="send-btn" onclick="sendMsg()">send</button>
       </div>
-    </div>
-    <!-- Terminal mirror -->
-    <div id="term-wrap">
-      <div id="term-hdr" onclick="toggleTerm()">
-        <div id="term-hdr-left">
-          <div class="term-dot-live"></div>
-          <span class="term-title">terminal</span>
-        </div>
-        <span class="term-chevron">▲</span>
-      </div>
-      <div id="term-out"></div>
     </div>
   </div>
 
@@ -520,19 +494,6 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
             <span class="fs-val" id="fs-val">13px</span>
             <button class="fs-btn" onclick="changeFontSize(1)">+</button>
           </div>
-        </div>
-        <div class="ds-divider"></div>
-        <div class="ds-row">
-          <div class="ds-row-info">
-            <div class="ds-row-label">terminal height</div>
-            <div class="ds-row-sub">height of the terminal mirror panel</div>
-          </div>
-          <select class="ds-select" id="term-height-sel" onchange="setTermHeight(this.value)">
-            <option value="120">compact (120px)</option>
-            <option value="160" selected>default (160px)</option>
-            <option value="220">tall (220px)</option>
-            <option value="300">extra tall (300px)</option>
-          </select>
         </div>
       </div>
     </div>
@@ -702,7 +663,6 @@ function handleEv(ev){
       document.getElementById('model-badge').textContent=`${ev.config.main_provider}/${ev.config.main_model}`;
       toast('configuration saved','success');
       break;
-    case 'terminal_output': handleTerminalOutput(ev); break;
   }
 }
 
@@ -971,7 +931,6 @@ function toast(msg,type='info'){const el=document.createElement('div');el.classN
 let dsState = {
   theme: localStorage.getItem('votor-theme') || 'dark',
   fontSize: parseInt(localStorage.getItem('votor-fontsize') || '13'),
-  termHeight: parseInt(localStorage.getItem('votor-termheight') || '160'),
   compact: localStorage.getItem('votor-compact') === 'true',
   showFooter: localStorage.getItem('votor-footer') !== 'false',
   timestamps: localStorage.getItem('votor-timestamps') === 'true',
@@ -987,12 +946,6 @@ function applyDsSettings() {
   document.body.style.fontSize = dsState.fontSize + 'px';
   const fsv = document.getElementById('fs-val');
   if (fsv) fsv.textContent = dsState.fontSize + 'px';
-
-  // Terminal height
-  const tw = document.getElementById('term-wrap');
-  if (tw && !termCollapsed) tw.style.height = dsState.termHeight + 'px';
-  const sel = document.getElementById('term-height-sel');
-  if (sel) sel.value = String(dsState.termHeight);
 
   // Compact
   document.getElementById('messages')?.classList.toggle('compact', dsState.compact);
@@ -1026,12 +979,6 @@ function changeFontSize(delta) {
   applyDsSettings();
 }
 
-function setTermHeight(val) {
-  dsState.termHeight = parseInt(val);
-  localStorage.setItem('votor-termheight', dsState.termHeight);
-  const tw = document.getElementById('term-wrap');
-  if (tw && !termCollapsed) tw.style.height = dsState.termHeight + 'px';
-}
 
 function applyCompact() {
   dsState.compact = document.getElementById('ds-compact')?.checked || false;
@@ -1058,28 +1005,6 @@ const compactStyle = document.createElement('style');
 compactStyle.textContent = '#messages.compact{gap:6px}';
 document.head.appendChild(compactStyle);
 
-// ── Terminal mirror ─────────────────────────────────────
-let termCollapsed = false;
-function toggleTerm(){
-  termCollapsed = !termCollapsed;
-  const tw = document.getElementById('term-wrap');
-  tw.classList.toggle('collapsed', termCollapsed);
-  if (!termCollapsed) tw.style.height = dsState.termHeight + 'px';
-}
-
-function appendTermLine(text, colorClass) {
-  const out = document.getElementById('term-out');
-  const line = document.createElement('span');
-  line.className = 'tl' + (colorClass ? ' ' + colorClass : '');
-  line.textContent = text;
-  out.appendChild(line);
-  out.scrollTop = out.scrollHeight;
-  while (out.children.length > 500) out.removeChild(out.firstChild);
-}
-
-function handleTerminalOutput(ev) {
-  appendTermLine(ev.text || '', ev.color || '');
-}
 
 // Apply settings on load
 applyDsSettings();

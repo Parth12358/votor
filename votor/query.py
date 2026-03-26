@@ -614,7 +614,7 @@ def run_edit_mode(
             plan_messages.append(msg)
 
     file_request_rounds = 0
-    MAX_FILE_REQUEST_ROUNDS = 3
+    MAX_FILE_REQUEST_ROUNDS = 5
     write_plan = None
 
     while file_request_rounds <= MAX_FILE_REQUEST_ROUNDS:

@@ -35,6 +35,7 @@
 | Dashboard markdown rendering | `marked.js` added to browser UI; streaming tokens accumulated in `S.curRaw`, rendered via `marked.parse()` on `query_complete`; streaming shows single replacing `.stream-raw` span, finalize swaps it for rendered HTML |
 | Dashboard streaming tokens | `votor/events.py` shim added; `broadcast_sync` registered at dashboard startup; `_stream_to_console` headless branch broadcasts `{"type":"token","token":chunk}` per chunk |
 | Dashboard edit mode progress | `run_edit_mode` broadcasts `step_progress` before each step and `diff` after each successful edit/create; commit line already forwarded via `_BroadcastConsole` |
+| Multi-file edit support | `MAX_FILE_REQUEST_ROUNDS` raised 3→5; `write_plan_prompt` updated: batch `need_files` requests, explicit dependency ordering rule, example shows multiple paths |
 
 ---
 
@@ -42,177 +43,18 @@
 
 ---
 
-### 0. UI/UX Redesign
+### ~~0. UI/UX Redesign~~ ✓ Done
 
-The core is functional. Every display surface still needs a polish pass.
-
-**`/init` wizard**
-- Current: raw prompt_toolkit radio lists with minimal styling
-- Goal: polished step-by-step wizard with section headers, progress indicator (step 1/5), inline validation, summary before confirming
-
-**REPL prompt**
-- Current: `project ❯ votor` — `votor` appears twice
-- Goal: cleaner prompt, maybe just `project ❯ ` with a subtle model indicator
-
-**Response panel**
-- Current: large bordered panel, dense footer metrics line
-- Goal: tighter layout, metrics easier to scan, sources inline or collapsible
-
-**`/status`, `/history`, `/config`**
-- Current: plain tables and key-value dumps
-- Goal: grouped sections, index health indicator, inline diff preview on history
-
-**General**
-- Consistent color language — success, warning, error, dim
-- Spinner consistency — some steps have spinners, others don't
-
-**Scope:** Primarily `repl.py` and `init_flow.py`. No logic changes — purely display layer.
+`/init` wizard, REPL prompt, response panel, `/status`/`/history`/`/config` views, color language, and spinner consistency all polished. Scope was `repl.py` and `init_flow.py`.
 
 ---
 
-### 0b. Dashboard — Remaining Gaps
+### ~~0b. Dashboard~~ ✓ Done
 
-Backend fully rewritten and working. Terminal parity complete. Browser receives query progress via `log` events, answer via `query_complete`, index progress via `index_progress`, analytics charts populated.
-
-**Still open:**
-
-**Streaming tokens to browser**
-Queries complete and the answer appears at once via `query_complete.answer`. Token-by-token streaming requires `_stream_to_console` to emit `{"type": "token", "content": chunk}` broadcasts when `_is_headless()`. Small change to `query.py` — import and call `broadcast_sync` from within the headless stream-consume loop.
-> Markdown rendering of the final answer is now working — `marked.js` renders `S.curRaw` on `query_complete`.
-
-**Edit mode progress in browser**
-Edit mode runs entirely in the terminal — `step_progress`, `diff`, and commit events are never broadcast. Requires emitting these from `run_edit_mode()` in `query.py`. Medium scope.
-
-**Terminal mirror panel**
-The browser has a terminal mirror strip that expects `terminal_output` events. Nothing emits them. Deferred to event bus refactor.
-
----
-
-### 0b Implementation Plan
-
-#### Step 1 — Streaming tokens (`query.py`, small)
-
-`_stream_to_console()` currently consumes the stream silently when `_is_headless()`. Change the headless branch to broadcast each chunk as a `token` event:
-
-```python
-# query.py — _stream_to_console(), headless branch
-from votor.dashboard import broadcast_sync   # add at top of file
-
-if _is_headless():
-    for chunk in stream_gen:
-        if isinstance(chunk, str):
-            full_content += chunk
-            broadcast_sync({"type": "token", "token": chunk})   # ← add
-        else:
-            result = chunk
-    ...
-```
-
-Frontend already handles `token` events via `appendTok`. No frontend changes needed.
-
-> **Circular import risk:** `query.py` is imported by `dashboard.py`. Fix: move `broadcast_sync` import inside the function body, or expose it via a thin `events.py` shim (no-op when dashboard is not running).
-
----
-
-#### Step 2 — Edit mode progress (`query.py`, medium)
-
-`run_edit_mode()` drives a Rich progress bar and calls `console.print` for diffs and commits. `_BroadcastConsole` already forwards `console.print` as `log` events, so text lines arrive in the browser. What's missing: structured `step_progress` and `diff` events for the browser's progress bar and diff viewer.
-
-**2a — step_progress events**
-
-In the step-execution loop (around line 755), after updating the progress bar description, add:
-
-```python
-broadcast_sync({
-    "type": "step_progress",
-    "current": step_idx + 1,
-    "total": len(steps),
-    "action": action,
-    "file": file_path,
-})
-```
-
-Frontend's `appendStep()` already renders these as a progress bar. No frontend changes needed.
-
-**2b — diff events**
-
-After `show_diff()` calls (lines 780-783, 803-806), add:
-
-```python
-broadcast_sync({
-    "type": "diff",
-    "title": f"{action}: {file_path}",
-    "diff": diff_text,
-})
-```
-
-Frontend's `appendDiff()` already renders these. No frontend changes needed.
-
-**2c — commit event**
-
-After the commit line (line 865), add:
-
-```python
-broadcast_sync({
-    "type": "log",
-    "html": f'<span class="g">✓ committed {n} file(s)</span>',
-})
-```
-
-Already handled by `log` events — no new event type needed.
-
----
-
-#### Step 3 — Circular import fix (`events.py`, small)
-
-Create `votor/events.py` as a thin shim so `query.py` never imports from `dashboard.py` directly:
-
-```python
-# votor/events.py
-_broadcast_fn = None
-
-def register(fn):
-    global _broadcast_fn
-    _broadcast_fn = fn
-
-def broadcast(event: dict):
-    if _broadcast_fn:
-        _broadcast_fn(event)
-```
-
-In `dashboard.py` startup:
-
-```python
-import votor.events as _events
-_events.register(broadcast_sync)
-```
-
-In `query.py`:
-
-```python
-from votor.events import broadcast
-# replace broadcast_sync(...) calls with broadcast(...)
-```
-
-When running from the REPL (no dashboard), `_broadcast_fn` is `None` and all calls are no-ops.
-
----
-
-#### Step 4 — Terminal mirror panel (deferred)
-
-The browser has a terminal mirror strip expecting `terminal_output` events. Requires the full event bus (item 1) to capture REPL-initiated terminal output. Defer until Step 3's `events.py` shim is in place and proven.
-
----
-
-#### Effort summary
-
-| Sub-task | File(s) | Effort |
-|---|---|---|
-| Streaming tokens | `query.py` | 1–2 hours |
-| Circular import shim | `events.py`, `dashboard.py`, `query.py` | 1 hour |
-| step_progress events | `query.py` | 1 hour |
-| diff events | `query.py` | 1 hour |
-| Terminal mirror | deferred | — |
+- ✓ Markdown rendering — `marked.js`, `S.curRaw` accumulator, rendered on `query_complete`
+- ✓ Streaming tokens — `events.py` shim, `_stream_to_console` headless branch broadcasts `token` events per chunk
+- ✓ Edit mode progress — `step_progress` + `diff` events broadcast from `run_edit_mode()`
+- ✓ Terminal mirror — removed from `index.html`; `_BroadcastConsole` terminal_output broadcasts also removed as no longer needed
 
 ---
 
@@ -221,12 +63,12 @@ The browser has a terminal mirror strip expecting `terminal_output` events. Requ
 For true real-time mirroring of terminal output in the browser, every `console.print` needs to emit an event that both frontends receive. The `_BroadcastConsole` approach covers dashboard-initiated queries. Terminal-initiated queries (from the REPL) still don't appear in the browser at all.
 
 **Files needed:**
-- `votor/events.py` — event bus, subscriber registry
-- Refactor `query.py` — replace `console.print` with `emit_event()`
+- `votor/events.py` — ✓ created as thin shim (`register`/`broadcast`); used by streaming + edit mode progress
+- Refactor `query.py` — replace remaining `console.print` with `emit_event()` calls
 - Refactor `repl.py` — subscribe to events, print to terminal
 - Update `dashboard.py` — subscribe to events, broadcast to WebSocket
 
-Large architectural change. Defer until streaming tokens and edit mode progress are working first.
+Large architectural change. `events.py` shim is in place — full refactor still deferred.
 
 ---
 
@@ -271,11 +113,9 @@ Shelved — needs more planning.
 
 ---
 
-### 5. Multi-File Edit Support
+### ~~5. Multi-File Edit Support~~ ✓ Done
 
-Raise `max_file_request_rounds` cap and strengthen `write_plan_prompt` guidance for cross-file dependency ordering.
-
-**Config:** `"max_file_request_rounds": 5`
+`MAX_FILE_REQUEST_ROUNDS` raised 3→5 in `query.py`. `write_plan_prompt` updated in `init_flow.py` and `.vectormind/prompts.json`: explicit dependency ordering rule, batch `need_files` requests, example shows multiple paths.
 
 ---
 
@@ -352,8 +192,8 @@ votor/
 
 | Item | Effort | Priority | Status |
 |---|---|---|---|
-| 0 UI/UX redesign | Large | High — affects every interaction | Partial — edit mode progress bar done |
-| 0b Dashboard | Large | High — browser gaps remain | Partial — markdown ✓, streaming ✓, edit mode progress ✓, terminal mirror open |
+| 0 UI/UX redesign | Large | High — affects every interaction | ✓ Done |
+| 0b Dashboard | Large | High — browser gaps remain | ✓ Done |
 | 1a egg-info exclude | Trivial | — | ✓ Done |
 | 1b pyproject keywords | Trivial | — | ✓ Done |
 | 1c Qdrant concurrent access | Small | — | ✓ Done |
@@ -362,7 +202,7 @@ votor/
 | 2 Reason mode | Medium | Medium | Open |
 | 3 Chunk rewrite (Option B) | Large | Low | Shelved |
 | 4 Conversation memory | Medium | Medium | Open |
-| 5 Multi-file edit support | Medium | High | Open |
+| 5 Multi-file edit support | Medium | High | ✓ Done |
 | 6 Step mode | Medium | High | Open |
 | 7 Watch mode | Small | Low | Open |
 | 8 Parallel client support | Medium | Low | Open |

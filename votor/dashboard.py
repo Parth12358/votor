@@ -116,6 +116,7 @@ class _BroadcastConsole:
     Wraps qmod.console so that every console.print() call:
       1. Passes through to the real terminal console (unchanged).
       2. Strips Rich markup and broadcasts a `log` event to the browser.
+      3. Also broadcasts a `terminal_output` event for the terminal mirror panel.
     Non-string objects (Panel, Markdown, Progress) are passed through only —
     they are never broadcast.
     """
@@ -129,7 +130,8 @@ class _BroadcastConsole:
         self._real.print(*args, **kwargs)
         text_parts = [a for a in args if isinstance(a, str)]
         if text_parts:
-            plain = _MARKUP_RE.sub('', ' '.join(text_parts)).strip()
+            raw = ' '.join(text_parts)
+            plain = _MARKUP_RE.sub('', raw).strip()
             if plain:
                 broadcast_sync({"type": "log", "html": plain})
 
