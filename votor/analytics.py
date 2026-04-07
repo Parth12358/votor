@@ -1,4 +1,4 @@
-# This file contains functions and classes for analyzing data and generating insights.
+import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime
