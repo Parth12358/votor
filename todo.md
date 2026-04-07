@@ -194,3 +194,17 @@ votor/
 | 6 Watch mode | Small | Low | Open |
 | 7 Parallel client support | Medium | Low | Open |
 | 8 File tree | Medium | Low | Open |
+
+
+
+
+Personal notes:
+Read mode is very broken
+
+high priority: file structure in context, a tree for this??
+high priority: remove the amount saved. Its a nonsense number
+high priority: conversation history ~ 5 messages ish, configurable, how to update this to make sure not to give entire output???
+med priority: update prompt to give user a summary on what was done
+very low priority: skills??
+medium priority: how to automate opening votor and installing...
+high priority: memory for convos and sessions. For user use and reference

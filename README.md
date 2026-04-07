@@ -148,7 +148,6 @@ ollama pull nomic-embed-text
 | 1c Qdrant concurrent access | Small | — | ✓ Done |
 | 1d debug print cleanup | Trivial | — | ✓ Done |
 | 5 Multi-file edit support | Medium | High | ✓ Done |
-| 1 Event bus (full mirroring) | Large | Medium | Open |
 | 2 Reason mode | Medium | Medium | Open |
 | 4 Conversation memory | Medium | Medium | Open |
 | 6 Step mode | Medium | High | Open |
