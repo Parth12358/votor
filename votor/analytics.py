@@ -1,6 +1,4 @@
-# Analytics and persistence helpers for tracking Votor query usage, token stats, costs, and file access.
-# This file contains functions and classes for analyzing and processing data within the Votor application.
-import json
+import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime
