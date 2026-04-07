@@ -14,8 +14,10 @@
 | Streaming | Main model streams tokens in real time, `/thinking` toggle |
 | Edit mode | Line-range edits, verification phase, batch commit, VS Code M indicator |
 | Edit mode bugfixes | tool_call tag stripping, create→edit fallback, path normalization, delete guard |
-| Edit mode progress bar | Rich `Progress` bar replaces inline prints — description updates per step, diffs and errors print inline below bar, delete confirmation pauses bar |
-| Git author | votor commits show `votor <votor@local>` as author |
+| 2 Chunk rewrite (Option B) | Large | Low | Shelved |
+| 5 Step mode | Medium | High | Open |
+| 5 Step mode | Medium | High | Open |
+| 2 Chunk rewrite (Option B) | Large | Low | Shelved |
 | init_flow | Ollama free-text model input, `write_prompts()` generates prompts.json on init |
 | PyPI / GitHub | Workflow for automated releases documented |
 | .gitignore | `.vectormind/` fully ignored |
