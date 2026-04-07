@@ -4,7 +4,8 @@
       "Bash(python -c \"import ast; ast.parse\\(open\\('votor/query.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('votor/query.py'\\).read\\(\\)\\); print\\('query.py OK'\\)\")",
       "Bash(python -c \"import ast; ast.parse\\(open\\('votor/init_flow.py'\\).read\\(\\)\\); print\\('init_flow.py OK'\\)\")",
-      "Bash(python -c \"import ast; ast.parse\\(open\\('votor/repl.py'\\).read\\(\\)\\); print\\('repl.py OK'\\)\")"
+      "Bash(python -c \"import ast; ast.parse\\(open\\('votor/repl.py'\\).read\\(\\)\\); print\\('repl.py OK'\\)\")",
+      "Bash(python3 -)"
     ]
   }
 }

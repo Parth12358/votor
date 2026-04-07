@@ -195,11 +195,17 @@ def call_llm(
 
     else:
         # OpenAI-compatible: OpenAI, Groq, Ollama
+        # Newer OpenAI o-series and some gpt models require max_completion_tokens
+        use_completion_tokens = provider == "openai" and (
+            model.startswith("o1") or model.startswith("o3") or model.startswith("o4")
+            or "gpt-5" in model
+        )
+        token_param = "max_completion_tokens" if use_completion_tokens else "max_tokens"
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            **{token_param: max_tokens},
         )
         return {
             "content":       response.choices[0].message.content,
@@ -272,11 +278,16 @@ def stream_llm(
         input_tokens  = 0
         output_tokens = 0
 
+        use_completion_tokens = provider == "openai" and (
+            model.startswith("o1") or model.startswith("o3") or model.startswith("o4")
+            or "gpt-5" in model
+        )
+        token_param = "max_completion_tokens" if use_completion_tokens else "max_tokens"
         response = client.chat.completions.create(
             model=model,
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            **{token_param: max_tokens},
             stream=True,
             stream_options={"include_usage": True},
         )

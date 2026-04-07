@@ -282,7 +282,7 @@ def run_tool_loop(
             if tool_name == "read_file":
                 path_key = tool_params.get("path", "")
                 if path_key in _read_cache:
-                    tool_result = _read_cache[path_key]
+                    tool_result = {"already_provided": True, "note": f"{path_key} was already read and provided above — do not request it again."}
                 else:
                     tool_result = dispatch_tool(tool_name, tool_params)
                     _read_cache[path_key] = tool_result
@@ -293,7 +293,7 @@ def run_tool_loop(
                 show_diff(tool_result["diff_preview"], title=f"edit — {tool_params.get('path', '')}")
 
             # truncate large read_file results before they enter context
-            CONTENT_CHAR_LIMIT = 8_000
+            CONTENT_CHAR_LIMIT = 32_000
             if tool_name == "read_file" and tool_result.get("content"):
                 c = tool_result["content"]
                 if len(c) > CONTENT_CHAR_LIMIT:
@@ -335,13 +335,18 @@ def _call_openai_with_tools(provider: str, model: str, messages: list) -> dict:
     client = get_llm_client(provider)
     tools  = get_tools_for_provider(provider)
 
+    use_completion_tokens = provider == "openai" and (
+        model.startswith("o1") or model.startswith("o3") or model.startswith("o4")
+        or "gpt-5" in model
+    )
+    token_param = "max_completion_tokens" if use_completion_tokens else "max_tokens"
     response = client.chat.completions.create(
         model=model,
         messages=messages,
         tools=tools,
         tool_choice="auto",
         temperature=0.2,
-        max_tokens=2048,
+        **{token_param: 2048},
     )
 
     choice  = response.choices[0]
@@ -711,6 +716,8 @@ def run_edit_mode(
     steps_executed: list[dict] = []
     summary_text = ""
     round_num = 0
+    files_read: set[str] = set()
+    blind_edit_strikes: dict[str, int] = {}
 
     # ---------------------------------------------------------------------
     # Main loop — call main, parse action, dispatch, feed back result
@@ -744,9 +751,25 @@ def run_edit_mode(
         try:
             parsed = json.loads(content)
         except Exception:
-            console.print(f"  [#e06c75]✗ main returned invalid JSON — aborting[/#e06c75]")
-            console.print(f"  [#5c6370]debug raw: {repr(content[:500])}[/#5c6370]")
-            break
+            # Try to recover: extract just the first valid JSON object using raw_decode,
+            # which stops at the end of the first complete object regardless of nesting depth.
+            # This handles: prose before/after JSON, two objects separated by whitespace, etc.
+            _decoder = json.JSONDecoder()
+            _parsed_first = None
+            for _i, _ch in enumerate(content):
+                if _ch == '{':
+                    try:
+                        _parsed_first, _ = _decoder.raw_decode(content, _i)
+                        break
+                    except Exception:
+                        continue
+            if _parsed_first is not None:
+                parsed = _parsed_first
+                console.print(f"  [#e5c07b]⚠ main returned extra content alongside JSON — using first object[/#e5c07b]")
+            else:
+                console.print(f"  [#e06c75]✗ main returned invalid JSON — aborting[/#e06c75]")
+                console.print(f"  [#5c6370]debug raw: {repr(content[:500])}[/#5c6370]")
+                break
 
         # -----------------------------------------------------------------
         # Done signal
@@ -757,8 +780,8 @@ def run_edit_mode(
             )
             _broadcast({
                 "type": "step_progress",
-                "current": round_num,
-                "total": max_rounds,
+                "round": round_num,
+                "max": max_rounds,
                 "action": "done",
                 "file": "",
             })
@@ -783,6 +806,36 @@ def run_edit_mode(
             messages.append({"role": "user", "content": entry})
             continue
 
+        # Guard — enforce read-before-edit: reject edit/create if file not yet read
+        if action in ("edit", "create") and file not in files_read:
+            blind_edit_strikes[file] = blind_edit_strikes.get(file, 0) + 1
+            if blind_edit_strikes[file] >= 3:
+                console.print(
+                    f"  [#e06c75]✗ edit mode aborted — main repeatedly attempted to edit "
+                    f"{file} without reading it first[/#e06c75]"
+                )
+                return {
+                    "answer":         f"Aborted: main repeatedly attempted to edit {file} without reading it first.",
+                    "steps_executed": steps_executed,
+                    "input_tokens":   total_input,
+                    "output_tokens":  total_output,
+                    "model":          model,
+                    "provider":       provider,
+                }
+            correction = (
+                f"SYSTEM: You must read {file} before editing it. "
+                f"Issue a read or read_range action for {file} first."
+            )
+            action_history.append(correction)
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": (
+                f"{correction}\n\n"
+                f"## Full Action History\n" + "\n".join(action_history) + "\n\n"
+                "Respond with the next JSON action, or {\"done\": true, \"summary\": \"...\"} if finished."
+            )})
+            round_num -= 1  # correction does not consume a round
+            continue
+
         # Build range suffix for display
         range_str = ""
         if action in ("read_range", "edit"):
@@ -801,11 +854,11 @@ def run_edit_mode(
         # Broadcast step_progress
         _broadcast({
             "type": "step_progress",
-            "current": round_num,
-            "total": max_rounds,
+            "round": round_num,
+            "max": max_rounds,
             "action": action,
             "file": file,
-            "range": range_str.strip() if range_str else None,
+            "range": range_str.strip().lstrip("lines ") if range_str else None,
         })
 
         # -----------------------------------------------------------------
@@ -819,6 +872,8 @@ def run_edit_mode(
                 lines = exec_result.get("lines", 0)
                 entry = f"Round {round_num}: read {file} → {lines} lines returned"
                 console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]{lines} lines returned[/#abb2bf]")
+                files_read.add(file)
+                blind_edit_strikes.pop(file, None)
             else:
                 error = exec_result.get("error", "file not found")
                 entry = f"Round {round_num}: read {file} → failed: {error}"
@@ -832,6 +887,8 @@ def run_edit_mode(
                 lines = exec_result.get("lines", 0)
                 entry = f"Round {round_num}: read_range {file} lines {start}-{end} → {lines} lines returned"
                 console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]{lines} lines returned[/#abb2bf]")
+                files_read.add(file)
+                blind_edit_strikes.pop(file, None)
             else:
                 error = exec_result.get("error", "file not found")
                 entry = f"Round {round_num}: read_range {file} → failed: {error}"
@@ -850,7 +907,7 @@ def run_edit_mode(
                     removed = sum(1 for ln in diff_preview.splitlines() if ln.startswith("-") and not ln.startswith("---"))
                     console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]diff: +{added} -{removed}[/#abb2bf]")
                     show_diff(diff_preview, title=f"edit — {file}")
-                    _broadcast({"type": "diff", "title": f"edit — {file}", "diff": diff_preview})
+                    _broadcast({"type": "diff", "file": file, "diff": diff_preview})
                 else:
                     console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]edit applied[/#abb2bf]")
                 steps_executed.append({
@@ -872,7 +929,7 @@ def run_edit_mode(
             if exec_result and exec_result.get("success"):
                 entry = f"Round {round_num}: create {file} → success"
                 console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]created[/#abb2bf]")
-                _broadcast({"type": "diff", "title": f"create — {file}", "diff": f"+++ {file}"})
+                _broadcast({"type": "diff", "file": file, "diff": f"+++ {file}"})
                 steps_executed.append({
                     "action": "create", "file": file, "success": True,
                     "error": None, "diff_preview": None,
@@ -921,10 +978,8 @@ def run_edit_mode(
     # If max rounds hit without done, force a final summary call
     # ---------------------------------------------------------------------
     if not done:
-        console.print(
-            f"  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] "
-            f"[#5c6370]→ max rounds reached, requesting summary[/#5c6370]"
-        )
+        _broadcast({"type": "max_calls_reached", "rounds": round_num})
+        console.print(f"  [#e5c07b]⚠ max calls reached — summarizing[/#e5c07b]")
         messages.append({"role": "user", "content": (
             f"You have reached the maximum number of rounds ({max_rounds}).\n"
             f"## Full Action History\n" + "\n".join(action_history) + "\n\n"

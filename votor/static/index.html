@@ -585,7 +585,7 @@ body{background:var(--bg);color:var(--text);font-family:var(--ui);font-size:13px
 <script>
 // Configure markdown renderer (marked v5+ removed headerIds/mangle)
 marked.use({ breaks: true, gfm: true });
-const S={panel:'chat',busy:false,src:false,think:false,ws:null,ready:false,cfg:{},curBubble:null,curFoot:null,curRaw:''};
+const S={panel:'chat',busy:false,src:false,think:false,ws:null,ready:false,cfg:{},curBubble:null,curFoot:null,curRaw:'',lastStepRow:null};
 
 // ── WebSocket ───────────────────────────────────────────
 function connectWS() {
@@ -652,8 +652,9 @@ function handleEv(ev){
       startAsstBubble();
       break;
     case 'token': appendTok(ev.token,ev.thinking); break;
-    case 'diff': appendDiff(ev.diff,ev.title); break;
-    case 'step_progress': appendStep(ev.current,ev.total,ev.action,ev.file); break;
+    case 'diff': appendDiff(ev.diff,ev.file); break;
+    case 'step_progress': appendStep(ev.round,ev.max,ev.action,ev.file,ev.range); break;
+    case 'max_calls_reached': appendMaxCallsWarning(); break;
     case 'query_complete': finalMsg(ev);setBusy(false);if(S.panel==='analytics')loadAnalytics(); break;
     case 'index_progress': showIdxProg(ev.current,ev.total,ev.file); break;
     case 'index_complete': hideIdxProg();if(S.panel==='index')loadIndex();toast(`indexed ${ev.files} files, ${ev.chunks} chunks`,'success'); break;
@@ -669,7 +670,7 @@ function handleEv(ev){
 // ── Chat helpers ────────────────────────────────────────
 function hideChatEmpty(){const e=document.getElementById('chat-empty');if(e)e.remove();}
 function addInputBubble(src,text){
-  S.curBubble=null;S.curFoot=null;
+  S.curBubble=null;S.curFoot=null;S.lastStepRow=null;
   ap(mk(`<div class="msg-src"><span class="badge ${src}">${src}</span></div><div class="bubble user">${esc(text)}</div>`));
 }
 function addLog(html){ap(mk(`<div class="bubble log">${html}</div>`));}
@@ -692,18 +693,36 @@ function appendTok(tok,think){
   const c=document.createElement('span');c.className='cursor';S.curBubble.appendChild(c);
   scrollChat();
 }
-function appendDiff(dt,title){
+function appendDiff(dt,file){
   const lines=dt.split('\n').map(l=>{
     if(l.startsWith('---')||l.startsWith('+++'))return`<div class="dh">${esc(l)}</div>`;
     if(l.startsWith('-'))return`<div class="dm">${esc(l)}</div>`;
     if(l.startsWith('+'))return`<div class="dp">${esc(l)}</div>`;
     return`<div class="dc">${esc(l)}</div>`;
   }).join('');
-  ap(mk(`<div class="diff-blk"><div class="dh">${esc(title)}</div>${lines}</div>`));
+  const blk=document.createElement('div');
+  blk.className='msg-row';
+  blk.innerHTML=`<div class="diff-blk">${lines}</div>`;
+  if(S.lastStepRow&&S.lastStepRow.parentNode){
+    S.lastStepRow.parentNode.insertBefore(blk,S.lastStepRow.nextSibling);
+    scrollChat();
+  }else{
+    ap(blk);
+  }
 }
-function appendStep(cur,total,action,file){
-  const p=Math.round((cur/total)*100);
-  ap(mk(`<div class="step-prog"><span class="g">${'█'.repeat(Math.round(p/5))}${'░'.repeat(20-Math.round(p/5))}</span><span class="y"> ${cur}/${total}</span> ${esc(action)} <span class="b">${esc(file)}</span></div>`));
+function appendStep(round,max,action,file,range){
+  let label=`round ${round}/${max}`;
+  if(action==='done'){label+=` \u2192 done`;}
+  else{
+    label+=` \u2192 ${esc(action)} <span style="color:var(--blue)">${esc(file||'')}</span>`;
+    if(range) label+=` <span style="color:var(--dim)">lines ${esc(range)}</span>`;
+  }
+  const row=mk(`<div class="step-prog">${label}</div>`);
+  S.lastStepRow=row;
+  ap(row);
+}
+function appendMaxCallsWarning(){
+  ap(mk(`<div class="step-prog" style="color:var(--yellow)">\u26a0 max calls reached \u2014 summarizing</div>`));
 }
 function finalMsg(ev){
   // No streaming bubble was started (headless mode) — render answer directly from ev.answer

@@ -1,5 +1,4 @@
-# Analytics helpers for tracking, summarizing, and reporting project/query activity.
-from __future__ import annotations
+import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime
