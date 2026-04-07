@@ -58,21 +58,7 @@
 
 ---
 
-### 1. Event Bus (full terminal↔dashboard mirroring)
-
-For true real-time mirroring of terminal output in the browser, every `console.print` needs to emit an event that both frontends receive. The `_BroadcastConsole` approach covers dashboard-initiated queries. Terminal-initiated queries (from the REPL) still don't appear in the browser at all.
-
-**Files needed:**
-- `votor/events.py` — ✓ created as thin shim (`register`/`broadcast`); used by streaming + edit mode progress
-- Refactor `query.py` — replace remaining `console.print` with `emit_event()` calls
-- Refactor `repl.py` — subscribe to events, print to terminal
-- Update `dashboard.py` — subscribe to events, broadcast to WebSocket
-
-Large architectural change. `events.py` shim is in place — full refactor still deferred.
-
----
-
-### 2. Reason Mode
+### 1. Reason Mode
 
 New write mode variant where main can course-correct between steps.
 
@@ -89,7 +75,7 @@ sub reads files → main decides first action → sub executes one step
 
 ---
 
-### 3. Option B — Chunk Rewrite at Index Time
+### 2. Option B — Chunk Rewrite at Index Time
 
 Shelved — needs more planning.
 
@@ -99,7 +85,7 @@ Shelved — needs more planning.
 
 ---
 
-### 4. Conversation Memory
+### 3. Conversation Memory
 
 **The idea:** Embed each exchange into Qdrant with `type: conversation` metadata. Retrieve relevant past exchanges alongside code chunks on future queries.
 
@@ -113,13 +99,13 @@ Shelved — needs more planning.
 
 ---
 
-### ~~5. Multi-File Edit Support~~ ✓ Done
+### ~~4. Multi-File Edit Support~~ ✓ Done
 
 `MAX_FILE_REQUEST_ROUNDS` raised 3→5 in `query.py`. `write_plan_prompt` updated in `init_flow.py` and `.vectormind/prompts.json`: explicit dependency ordering rule, batch `need_files` requests, example shows multiple paths.
 
 ---
 
-### 6. Step Mode — Interactive Todo List
+### 5. Step Mode — Interactive Todo List
 
 Main generates a full plan once, presents it as a persistent checklist. User drives execution step by step.
 
@@ -131,7 +117,7 @@ Main generates a full plan once, presents it as a persistent checklist. User dri
 
 ---
 
-### 7. Watch Mode
+### 6. Watch Mode
 
 Auto `/update` on file save using `watchdog` (already in dependencies). 2s debounce, prints `↺ updated: filename.py`.
 
@@ -139,7 +125,7 @@ Auto `/update` on file save using `watchdog` (already in dependencies). 2s debou
 
 ---
 
-### 8. Parallel Client Support
+### 7. Parallel Client Support
 
 Two votor terminals in the same project crash on Qdrant (`Storage folder already accessed by another instance`).
 
@@ -149,7 +135,7 @@ Two votor terminals in the same project crash on Qdrant (`Storage folder already
 
 ---
 
-### 9. File Tree — Index, Context, and Dashboard
+### 8. File Tree — Index, Context, and Dashboard
 
 Build and persist a project file tree on every index. Inject it into LLM context so main knows exact file paths without guessing. Show it in the dashboard sidebar.
 
@@ -198,12 +184,11 @@ votor/
 | 1b pyproject keywords | Trivial | — | ✓ Done |
 | 1c Qdrant concurrent access | Small | — | ✓ Done |
 | 1d debug print cleanup | Trivial | — | ✓ Done |
-| 1 Event bus (full mirroring) | Large | Medium — needed for true parity | Open |
-| 2 Reason mode | Medium | Medium | Open |
-| 3 Chunk rewrite (Option B) | Large | Low | Shelved |
-| 4 Conversation memory | Medium | Medium | Open |
-| 5 Multi-file edit support | Medium | High | ✓ Done |
-| 6 Step mode | Medium | High | Open |
-| 7 Watch mode | Small | Low | Open |
-| 8 Parallel client support | Medium | Low | Open |
-| 9 File tree | Medium | Low | Open |
+| 1 Reason mode | Medium | Medium | Open |
+| 2 Chunk rewrite (Option B) | Large | Low | Shelved |
+| 3 Conversation memory | Medium | Medium | Open |
+| 4 Multi-file edit support | Medium | High | ✓ Done |
+| 5 Step mode | Medium | High | Open |
+| 6 Watch mode | Small | Low | Open |
+| 7 Parallel client support | Medium | Low | Open |
+| 8 File tree | Medium | Low | Open |

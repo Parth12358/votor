@@ -20,8 +20,8 @@ ENV_FILE    = Path(".env")
 
 DEFAULT_CONFIG = {
     "main_provider":    "openai",
-    "write_mode":       "edit",
     "verify_changes":   False,
+    "write_max_calls":  6,
     "main_model":       "gpt-4o-mini",
     "fallback_model":   "gpt-4o",
     "sub_provider":     "openai",
@@ -100,7 +100,9 @@ STEP_EXPLANATIONS = {
     "index": (
         "Chunk size controls how files are split for indexing.\n"
         "  Smaller chunks = more precise retrieval but more vectors.\n"
-        "  top_k controls how many chunks are retrieved per query."
+        "  top_k controls how many chunks are retrieved per query.\n"
+        "  write_max_calls caps how many read/edit rounds the AI can take per edit query.\n"
+        "  Higher = more thorough edits; lower = faster, cheaper."
     ),
 }
 
@@ -168,6 +170,25 @@ def ask_text(prompt_text: str, default: str = "") -> str:
     console.print(f"\n[dim]{prompt_text}[/dim]")
     raw = pt_prompt(f"  [{default}]: ").strip()
     return raw if raw else default
+
+
+def _ask_int(prompt_text: str, default: int, min_val: int, max_val: int) -> int:
+    """Accept any integer in [min_val, max_val]. Enter keeps the default."""
+    from prompt_toolkit import prompt as pt_prompt
+    console.print(f"\n  [#5c6370]{prompt_text}[/#5c6370]")
+    console.print(f"  [#5c6370]range:[/#5c6370] [#abb2bf]{min_val}–{max_val}[/#abb2bf]")
+    while True:
+        raw = pt_prompt(f"  [{default}]: ").strip()
+        if not raw:
+            return default
+        try:
+            value = int(raw)
+        except ValueError:
+            console.print(f"  [#e06c75]✗[/#e06c75]  [#abb2bf]Enter a whole number between {min_val} and {max_val}[/#abb2bf]")
+            continue
+        if min_val <= value <= max_val:
+            return value
+        console.print(f"  [#e06c75]✗[/#e06c75]  [#abb2bf]Must be between {min_val} and {max_val}[/#abb2bf]")
 
 
 def ask_yes_no(prompt_text: str, default: bool = True) -> bool:
@@ -470,8 +491,18 @@ def setup_index_options(config: dict) -> dict:
     _check_quit(top_k)
     config["top_k"] = int(top_k)
 
+    max_calls = _ask_int(
+        "Max reasoning calls per edit session (write_max_calls):",
+        default=6,
+        min_val=1,
+        max_val=20,
+    )
+    _check_quit(max_calls)
+    config["write_max_calls"] = max_calls
+
     _step_confirm("chunk size", chunk)
     _step_confirm("top k", top_k)
+    _step_confirm("max edit rounds", str(max_calls))
     return config
 
 
@@ -490,6 +521,7 @@ def print_summary(config: dict):
     console.print(f"  [#5c6370]embed[/#5c6370]      [#c678dd]{config['embedding_provider']}[/#c678dd] [#abb2bf]/[/#abb2bf] [#61afef]{config['embedding_model']}[/#61afef]")
     console.print(f"  [#5c6370]top k[/#5c6370]      [#abb2bf]{config['top_k']}[/#abb2bf]")
     console.print(f"  [#5c6370]chunk[/#5c6370]      [#abb2bf]{config['chunk_size']}[/#abb2bf]")
+    console.print(f"  [#5c6370]max rounds[/#5c6370] [#abb2bf]{config.get('write_max_calls', 6)}[/#abb2bf]")
     console.print(f"  [#5c6370]git[/#5c6370]        [#abb2bf]{config['git_remote']}[/#abb2bf]")
     console.print()
 
@@ -513,7 +545,49 @@ def write_prompts():
 
         "write_summary_prompt": "You are votor, a project-aware coding assistant.\nYou have just executed a series of file changes on behalf of the user.\nSummarize what was done clearly and concisely.\n\nRules:\n- List each file that was successfully changed and what changed\n- List any steps that failed and why\n- Mention the git commits that were made\n- Be concise — no need to repeat the full diffs\n- Never suggest git commands directly — only reference votor commands like /undo, /diff, /history for follow-up actions\n- If everything succeeded, end with a positive confirmation\n- If some steps failed, suggest what the user might do to fix them",
 
-        "verify_changes_prompt": "You are votor, a project-aware coding assistant.\nYou have just made file changes on behalf of the user.\nReview the diffs and the full file contents after editing.\n\nYour job:\n- Check if the changes correctly implement what the user asked for\n- Identify any issues: wrong lines changed, missing changes, syntax errors, logic problems\n- Be concise — note what is correct and what is wrong\n- Do NOT suggest a new plan — just report what you see\n\nEnd your response with either:\n  VERIFIED — changes look correct\n  ISSUES FOUND — [brief description of problems]"
+        "verify_changes_prompt": "You are votor, a project-aware coding assistant.\nYou have just made file changes on behalf of the user.\nReview the diffs and the full file contents after editing.\n\nYour job:\n- Check if the changes correctly implement what the user asked for\n- Identify any issues: wrong lines changed, missing changes, syntax errors, logic problems\n- Be concise — note what is correct and what is wrong\n- Do NOT suggest a new plan — just report what you see\n\nEnd your response with either:\n  VERIFIED — changes look correct\n  ISSUES FOUND — [brief description of problems]",
+
+        "edit_mode_main_prompt": (
+            "You are votor, a project-aware coding assistant in EDIT MODE.\n"
+            "You are the reasoning agent. You decide what to do next. You never execute anything directly.\n"
+            "\n"
+            "Each response must be exactly one JSON action object — no prose, no markdown, no explanation outside the JSON.\n"
+            "\n"
+            "Valid actions:\n"
+            "  { \"action\": \"read\",       \"file\": \"relative/path\" }\n"
+            "  { \"action\": \"read_range\", \"file\": \"relative/path\", \"start_line\": N, \"end_line\": N }\n"
+            "  { \"action\": \"edit\",       \"file\": \"relative/path\", \"start_line\": N, \"end_line\": N, \"new_content\": \"...\" }\n"
+            "  { \"action\": \"create\",     \"file\": \"relative/path\", \"content\": \"full file text\" }\n"
+            "  { \"action\": \"delete\",     \"file\": \"relative/path\", \"confirm\": true }\n"
+            "  { \"done\": true,           \"summary\": \"...\" }\n"
+            "\n"
+            "Rules:\n"
+            "- Output ONLY the JSON object — nothing before it, nothing after it\n"
+            "- Never assume file contents — always read a file before editing it\n"
+            "- Use read_range when you only need a specific section; use read for the full file\n"
+            "- For edits: start_line and end_line are 1-indexed and inclusive\n"
+            "- For inserts: set end_line < start_line to insert before start_line without replacing anything\n"
+            "- For creates: content must be the complete file text\n"
+            "- Use relative file paths exactly as they appear in the retrieved context\n"
+            "- Never request actions on files inside .vectormind/\n"
+            "- Use the action history to understand what has already been done — never repeat a successful action\n"
+            "- If an action fails, read the error and course-correct: try a different approach, a different line range, or a different file\n"
+            "- When all required changes are complete, output the done action\n"
+            "- The done summary must be human-readable: list what changed, which files were affected, and any failures encountered\n"
+            "- Never output done without having made at least one successful edit or create"
+        ),
+
+        "edit_mode_sub_prompt": (
+            "You are a pure executor. You receive one action and fulfill it exactly as given.\n"
+            "You make no decisions. You do not interpret, plan, or add steps.\n"
+            "\n"
+            "Rules:\n"
+            "- Execute the action exactly as specified — do not modify parameters\n"
+            "- Return the result immediately: file content for reads, diff for edits, success or error for all actions\n"
+            "- Never add extra steps beyond what was asked\n"
+            "- Never ask clarifying questions\n"
+            "- If the action fails, return the error message and stop — do not attempt a fix or alternative"
+        ),
     }
 
     with open(prompts_file, "w") as f:

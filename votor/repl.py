@@ -305,8 +305,8 @@ def print_config(cfg: dict):
     table.add_row("main",       pm("main_provider", "main_model"))
     table.add_row("fallback",   val(cfg.get("fallback_model", ""), "#61afef"))
     table.add_row("sub",        pm("sub_provider", "sub_model"))
-    table.add_row("write mode", val(cfg.get("write_mode", "edit")))
     table.add_row("verify",     boolean(cfg.get("verify_changes", False)))
+    table.add_row("max rounds", val(cfg.get("write_max_calls", 6), "#e5c07b"))
     table.add_row("", "")
 
     # Embeddings

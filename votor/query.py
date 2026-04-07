@@ -533,6 +533,140 @@ def run_sub_tool_loop(
 
 
 # ---------------------------------------------------------------------------
+# Edit mode — sub executors
+# ---------------------------------------------------------------------------
+
+def _reason_read(file: str, config: dict) -> dict:
+    """Execute a full-file read for reason mode. Returns result dict."""
+    from votor.tools import read_file as read_file_tool
+    result = read_file_tool(file)
+    if result.get("exists") and result.get("content") is not None:
+        return {
+            "success": True,
+            "content": result["content"],
+            "lines":   result.get("lines", 0),
+            "exists":  True,
+        }
+    return {
+        "success": False,
+        "error":   result.get("error", f"File not found: {file}"),
+        "exists":  False,
+    }
+
+
+def _reason_read_range(file: str, start_line: int, end_line: int, config: dict) -> dict:
+    """Execute a line-range read for reason mode. Returns result dict."""
+    from votor.tools import read_file as read_file_tool
+    result = read_file_tool(file)
+    if not result.get("exists") or result.get("content") is None:
+        return {
+            "success": False,
+            "error":   result.get("error", f"File not found: {file}"),
+            "exists":  False,
+        }
+
+    all_lines = result["content"].splitlines(keepends=True)
+    total = len(all_lines)
+
+    # Clamp range to file bounds
+    start = max(1, start_line)
+    end   = min(end_line, total)
+
+    if start > total:
+        return {
+            "success": False,
+            "error":   f"start_line {start_line} exceeds file length {total}",
+            "exists":  True,
+        }
+
+    sliced = all_lines[start - 1 : end]
+    return {
+        "success": True,
+        "content": "".join(sliced),
+        "lines":   len(sliced),
+        "exists":  True,
+    }
+
+
+def _reason_edit(file: str, start_line: int, end_line: int, new_content: str, config: dict) -> dict:
+    """Execute a line-range edit for reason mode. Returns result dict."""
+    result = dispatch_tool("edit_file_lines", {
+        "path":        file,
+        "start_line":  str(start_line),
+        "end_line":    str(end_line),
+        "new_content": new_content,
+        "stage_only":  "true",
+    })
+    if result.get("success"):
+        return {
+            "success":      True,
+            "diff_preview": result.get("diff_preview", ""),
+        }
+    return {
+        "success": False,
+        "error":   result.get("error", "unknown error"),
+    }
+
+
+def _reason_create(file: str, content: str, config: dict) -> dict:
+    """Execute a file creation for reason mode. Returns result dict."""
+    result = dispatch_tool("create_file", {
+        "path":       file,
+        "content":    content,
+        "stage_only": "true",
+    })
+    if result.get("success"):
+        return {"success": True}
+
+    # Fallback: file already exists → full replacement via edit_file_lines
+    if "already exists" in str(result.get("error", "")):
+        console.print(f"  [#5c6370]file exists — retrying as full replacement[/#5c6370]")
+        content_lines = content.splitlines()
+        result = dispatch_tool("edit_file_lines", {
+            "path":        file,
+            "start_line":  "1",
+            "end_line":    str(len(content_lines) + 100),
+            "new_content": content,
+            "stage_only":  "true",
+        })
+        if result.get("success"):
+            return {
+                "success":      True,
+                "diff_preview": result.get("diff_preview", ""),
+            }
+
+    return {
+        "success": False,
+        "error":   result.get("error", "unknown error"),
+    }
+
+
+def _reason_delete(file: str, config: dict) -> dict:
+    """Execute a file deletion for reason mode. Returns result dict."""
+    console.print(f"  [#e06c75]⚠ delete requested:[/#e06c75] [#61afef]{file}[/#61afef]")
+    console.print(
+        f"  [#5c6370]Type [#e06c75]yes[/#e06c75] to confirm or anything else to skip:[/#5c6370] ",
+        end="",
+    )
+    try:
+        confirm = input().strip().lower()
+    except Exception:
+        confirm = ""
+
+    if confirm != "yes":
+        console.print(f"  [#5c6370]skipped[/#5c6370]")
+        return {"success": False, "error": "user declined"}
+
+    result = dispatch_tool("delete_file", {"path": file, "stage_only": "true"})
+    if result.get("success"):
+        return {"success": True}
+    return {
+        "success": False,
+        "error":   result.get("error", "unknown error"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Edit mode orchestration
 # ---------------------------------------------------------------------------
 
@@ -544,91 +678,57 @@ def run_edit_mode(
 ) -> dict:
     """
     Edit mode orchestration.
-    Sub reads files → main plans exact diffs → sub executes → main summarizes.
-    Always exactly 2 main calls.
+    Main drives all reads and writes in a loop. Sub is a pure executor that
+    fulfills one action at a time and returns the result. Main sees every
+    result and decides the next action.
     """
     provider     = config.get("main_provider", "openai")
     model        = config.get("main_model",    "gpt-4o-mini")
-    sub_provider = config.get("sub_provider",  provider)
-    sub_model    = config.get("sub_model",     model)
     prompts      = load_prompts()
 
     total_input  = 0
     total_output = 0
+    max_rounds   = config.get("write_max_calls", 6)
 
-    # -------------------------------------------------------------------------
-    # Phase 1: Sub reads identified files into messages thread
-    # -------------------------------------------------------------------------
-    console.print(f"  [#5c6370]sub[/#5c6370] [#c678dd]{sub_provider}/{sub_model}[/#c678dd] [#5c6370]→ reading files for edit context[/#5c6370]")
+    from votor.events import broadcast as _broadcast
 
-    sub_messages = [
-        {"role": "system", "content": prompts["sub_system_prompt"]},
-        {"role": "user",   "content": (
-            f"The user wants to make changes to the project.\n\n"
-            f"Files to read: {classification['files']}\n\n"
-            f"Read all listed files using read_file."
-        )}
-    ]
+    # ---------------------------------------------------------------------
+    # Build initial prompt — user query + semantic context, no file contents
+    # ---------------------------------------------------------------------
+    system_prompt = prompts.get("edit_mode_main_prompt", prompts.get("write_plan_prompt", ""))
 
-    # Cap iterations to number of files — one read per file maximum
-    max_iter = max(len(classification["files"]), 1)
-    run_tool_loop(
-        provider=sub_provider,
-        model=sub_model,
-        messages=sub_messages,
-        allow_tools=True,
-        max_iterations=max_iter
-    )
-
-    # Normalize absolute paths in tool results to relative paths
-    project_root = str(Path(".").resolve())
-    for msg in sub_messages:
-        if msg.get("role") == "tool":
-            try:
-                tool_result = json.loads(msg["content"])
-                if tool_result.get("path"):
-                    abs_path = tool_result["path"]
-                    if abs_path.startswith(project_root):
-                        rel = abs_path[len(project_root):].lstrip("\\/")
-                        tool_result["path"] = rel
-                        msg["content"] = json.dumps(tool_result)
-            except Exception:
-                pass
-
-    # -------------------------------------------------------------------------
-    # Phase 2: Main generates write plan (with file request loop, cap 3 rounds)
-    # -------------------------------------------------------------------------
-    plan_messages = [
-        {"role": "system", "content": prompts["write_plan_prompt"]},
+    messages = [
+        {"role": "system", "content": system_prompt},
         {"role": "user",   "content": (
             f"## Retrieved Context\n\n{base_context}\n\n"
-            f"## User Request\n\n{question}"
+            f"## User Request\n\n{question}\n\n"
+            "Respond with a single JSON action object. "
+            "Available actions: read, read_range, edit, create, delete, or done."
         )}
     ]
 
-    # Append sub's tool results (file contents) directly to plan messages
-    for msg in sub_messages:
-        if msg["role"] in ("assistant", "tool") or (
-            msg["role"] == "user" and msg not in (sub_messages[0], sub_messages[1])
-        ):
-            plan_messages.append(msg)
+    action_history: list[str] = []
+    steps_executed: list[dict] = []
+    summary_text = ""
+    round_num = 0
 
-    file_request_rounds = 0
-    MAX_FILE_REQUEST_ROUNDS = 5
-    write_plan = None
+    # ---------------------------------------------------------------------
+    # Main loop — call main, parse action, dispatch, feed back result
+    # ---------------------------------------------------------------------
+    from votor.providers import stream_llm
 
-    while file_request_rounds <= MAX_FILE_REQUEST_ROUNDS:
-        console.print(f"  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ generating edit plan (round {file_request_rounds + 1})[/#5c6370]")
+    done = False
 
-        from votor.providers import stream_llm
-        plan_result = _stream_to_console(
-            stream_llm(provider, model, plan_messages, max_tokens=4096),
-            show_thinking=False
+    while round_num < max_rounds and not done:
+        round_num += 1
+        result = _stream_to_console(
+            stream_llm(provider, model, messages, max_tokens=4096),
+            show_thinking=False,
         )
-        total_input  += plan_result.get("input_tokens", 0)
-        total_output += plan_result.get("output_tokens", 0)
+        total_input  += result.get("input_tokens", 0)
+        total_output += result.get("output_tokens", 0)
 
-        content = plan_result["content"].strip()
+        content = result["content"].strip()
 
         # Strip markdown fences
         if content.startswith("```"):
@@ -637,315 +737,236 @@ def run_edit_mode(
                 content = content[4:]
             content = content.strip()
 
-        # Strip <tool_call> tags (some local models wrap output this way)
+        # Strip <tool_call> tags
         if "<tool_call>" in content:
             content = content.replace("<tool_call>", "").replace("</tool_call>", "").strip()
 
         try:
             parsed = json.loads(content)
         except Exception:
-            console.print(f"  [#e06c75]✗ main returned invalid plan JSON — aborting[/#e06c75]")
-            console.print(f"  [#5c6370]debug raw plan: {repr(content[:500])}[/#5c6370]")
-            return {
-                "answer":         "Edit mode failed — main did not return a valid plan.",
-                "steps_executed": [],
-                "input_tokens":   total_input,
-                "output_tokens":  total_output,
-                "model":          model,
-                "provider":       provider,
-            }
-
-        if "need_files" in parsed and file_request_rounds < MAX_FILE_REQUEST_ROUNDS:
-            needed = parsed["need_files"]
-            console.print(f"  [#5c6370]main requested files:[/#5c6370] [#61afef]{needed}[/#61afef]")
-
-            extra_messages = [
-                {"role": "system", "content": prompts["sub_system_prompt"]},
-                {"role": "user",   "content": f"Read these files: {needed}"}
-            ]
-            run_tool_loop(
-                provider=sub_provider,
-                model=sub_model,
-                messages=extra_messages,
-                allow_tools=True,
-                max_iterations=len(needed) + 2
-            )
-            for msg in extra_messages:
-                if msg["role"] in ("assistant", "tool"):
-                    plan_messages.append(msg)
-
-            plan_messages.append({
-                "role": "user",
-                "content": "Here are the additional files you requested. Now output the write plan."
-            })
-            file_request_rounds += 1
-            continue
-
-        if "write_plan" in parsed:
-            write_plan = parsed["write_plan"]
+            console.print(f"  [#e06c75]✗ main returned invalid JSON — aborting[/#e06c75]")
+            console.print(f"  [#5c6370]debug raw: {repr(content[:500])}[/#5c6370]")
             break
 
-        console.print(f"  [#e06c75]✗ main returned unexpected response — aborting[/#e06c75]")
-        return {
-            "answer":         "Edit mode failed — unexpected response from main.",
-            "steps_executed": [],
-            "input_tokens":   total_input,
-            "output_tokens":  total_output,
-            "model":          model,
-            "provider":       provider,
-        }
-
-    if not write_plan:
-        return {
-            "answer":         "Edit mode failed — could not generate plan after maximum file request rounds.",
-            "steps_executed": [],
-            "input_tokens":   total_input,
-            "output_tokens":  total_output,
-            "model":          model,
-            "provider":       provider,
-        }
-
-    # -------------------------------------------------------------------------
-    # Phase 3: Sub executes plan steps mechanically — with progress bar
-    # -------------------------------------------------------------------------
-    from rich.progress import Progress, BarColumn, TextColumn, MofNCompleteColumn
-
-    steps_executed = []
-    total_steps    = len(write_plan)
-
-    # Build protected files set upfront — delete refused if file also edited/created
-    protected_files = {
-        s.get("file", "")
-        for s in write_plan
-        if s.get("action") in ("edit", "create")
-    }
-
-    console.print(
-        f"\n  [#5c6370]planning complete —[/#5c6370] "
-        f"[#abb2bf]{total_steps}[/#abb2bf] "
-        f"[#5c6370]step{'s' if total_steps != 1 else ''}[/#5c6370]\n"
-    )
-
-    with Progress(
-        TextColumn("  "),
-        BarColumn(
-            bar_width=20,
-            complete_style="#00ffaa",
-            finished_style="#00ffaa",
-            pulse_style="#1e1e2e",
-        ),
-        MofNCompleteColumn(),
-        TextColumn("  [#5c6370]{task.description}[/#5c6370]"),
-        console=console,
-        transient=False,
-    ) as progress:
-        task = progress.add_task("starting...", total=total_steps)
-
-        from votor.events import broadcast as _broadcast
-        for i, step in enumerate(write_plan):
-            action = step.get("action")
-            file   = step.get("file", "")
-
-            # Normalize absolute path to relative
-            project_root = str(Path(".").resolve())
-            if file.startswith(project_root):
-                file = file[len(project_root):].lstrip("\\/")
-                step["file"] = file
-
-            # Update bar description
-            progress.update(task, description=f"[#e5c07b]{action}[/#e5c07b] [#61afef]{file}[/#61afef]")
-            _broadcast({"type": "step_progress", "current": i + 1, "total": total_steps, "action": action, "file": file})
-
-            # Guard — never allow modifications to .vectormind
-            if ".vectormind" in file:
-                progress.stop()
-                console.print(f"  [#e06c75]✗ refused — .vectormind is protected[/#e06c75]")
-                progress.start()
-                steps_executed.append({
-                    "action": action, "file": file,
-                    "success": False,
-                    "error": "refused — .vectormind is protected",
-                    "diff_preview": None,
-                })
-                progress.advance(task)
-                continue
-
-            if action == "edit":
-                result = dispatch_tool("edit_file_lines", {
-                    "path":        file,
-                    "start_line":  str(step.get("start_line", 1)),
-                    "end_line":    str(step.get("end_line", 1)),
-                    "new_content": step.get("new_content", ""),
-                    "stage_only":  "true",
-                })
-                # Show diff inline after step completes
-                if result.get("success") and result.get("diff_preview"):
-                    progress.stop()
-                    show_diff(result["diff_preview"], title=f"edit — {file}")
-                    progress.start()
-                    _broadcast({"type": "diff", "title": f"edit — {file}", "diff": result["diff_preview"]})
-
-            elif action == "create":
-                result = dispatch_tool("create_file", {
-                    "path":       file,
-                    "content":    step.get("content", ""),
-                    "stage_only": "true",
-                })
-                if not result.get("success") and "already exists" in str(result.get("error", "")):
-                    progress.stop()
-                    console.print(f"  [#5c6370]file exists — retrying as full replacement[/#5c6370]")
-                    progress.start()
-                    content_lines = step.get("content", "").splitlines()
-                    result = dispatch_tool("edit_file_lines", {
-                        "path":        file,
-                        "start_line":  "1",
-                        "end_line":    str(len(content_lines) + 100),
-                        "new_content": step.get("content", ""),
-                        "stage_only":  "true",
-                    })
-                    if result.get("success") and result.get("diff_preview"):
-                        progress.stop()
-                        show_diff(result["diff_preview"], title=f"create (replaced) — {file}")
-                        progress.start()
-                        _broadcast({"type": "diff", "title": f"create (replaced) — {file}", "diff": result["diff_preview"]})
-
-            elif action == "delete":
-                if file in protected_files:
-                    result = {
-                        "success": False,
-                        "error": "refused — cannot delete a file that is also being edited",
-                    }
-                    progress.stop()
-                    console.print(f"  [#e06c75]✗ refused — {file} is also being edited[/#e06c75]")
-                    progress.start()
-                else:
-                    progress.stop()
-                    console.print(f"  [#e06c75]⚠ delete requested:[/#e06c75] [#61afef]{file}[/#61afef]")
-                    console.print(
-                        f"  [#5c6370]Type [#e06c75]yes[/#e06c75] to confirm or anything else to skip:[/#5c6370] ",
-                        end="",
-                    )
-                    try:
-                        confirm = input().strip().lower()
-                    except Exception:
-                        confirm = ""
-                    if confirm == "yes":
-                        result = dispatch_tool("delete_file", {"path": file, "stage_only": "true"})
-                    else:
-                        result = {"success": False, "error": "skipped by user"}
-                        console.print(f"  [#5c6370]skipped[/#5c6370]")
-                    progress.start()
-
-            else:
-                result = {"success": False, "error": f"unknown action: {action}"}
-
-            # Print error inline if failed
-            if not result.get("success"):
-                progress.stop()
-                console.print(f"  [#e06c75]✗ {result.get('error', 'unknown error')}[/#e06c75]")
-                progress.start()
-
-            steps_executed.append({
-                "action":       action,
-                "file":         file,
-                "success":      result.get("success", False),
-                "error":        result.get("error"),
-                "diff_preview": result.get("diff_preview"),
+        # -----------------------------------------------------------------
+        # Done signal
+        # -----------------------------------------------------------------
+        if parsed.get("done"):
+            console.print(
+                f"  [#5c6370]round {round_num}/{max_rounds}  →  done[/#5c6370]"
+            )
+            _broadcast({
+                "type": "step_progress",
+                "current": round_num,
+                "total": max_rounds,
+                "action": "done",
+                "file": "",
             })
+            summary_text = parsed.get("summary", "")
+            done = True
+            break
 
-            progress.advance(task)
+        action = parsed.get("action")
+        file   = parsed.get("file", "")
 
-    console.print()
+        # Normalize absolute path
+        project_root = str(Path(".").resolve())
+        if file.startswith(project_root):
+            file = file[len(project_root):].lstrip("\\/")
 
-    # Batch commit all staged changes after all steps complete
+        # Guard — never allow modifications to .vectormind
+        if ".vectormind" in file:
+            entry = f"Round {round_num}: {action} {file} → refused — .vectormind is protected"
+            action_history.append(entry)
+            console.print(f"  [#e06c75]✗ refused — .vectormind is protected[/#e06c75]")
+            messages.append({"role": "assistant", "content": content})
+            messages.append({"role": "user", "content": entry})
+            continue
+
+        # Build range suffix for display
+        range_str = ""
+        if action in ("read_range", "edit"):
+            _s = parsed.get("start_line", "")
+            _e = parsed.get("end_line", "")
+            if _s and _e:
+                range_str = f" lines {_s}-{_e}"
+
+        # Print round header — before sub action executes
+        console.print(
+            f"  [#5c6370]round {round_num}/{max_rounds}  →  [/#5c6370]"
+            f"[#e5c07b]{action}[/#e5c07b] [#61afef]{file}[/#61afef]"
+            f"[#5c6370]{range_str}[/#5c6370]"
+        )
+
+        # Broadcast step_progress
+        _broadcast({
+            "type": "step_progress",
+            "current": round_num,
+            "total": max_rounds,
+            "action": action,
+            "file": file,
+            "range": range_str.strip() if range_str else None,
+        })
+
+        # -----------------------------------------------------------------
+        # Dispatch to stub executor
+        # -----------------------------------------------------------------
+        entry = ""
+
+        if action == "read":
+            exec_result = _reason_read(file, config)
+            if exec_result and exec_result.get("success"):
+                lines = exec_result.get("lines", 0)
+                entry = f"Round {round_num}: read {file} → {lines} lines returned"
+                console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]{lines} lines returned[/#abb2bf]")
+            else:
+                error = exec_result.get("error", "file not found")
+                entry = f"Round {round_num}: read {file} → failed: {error}"
+                console.print(f"  [#e06c75]✗[/#e06c75] [#abb2bf]failed: {error}[/#abb2bf]")
+
+        elif action == "read_range":
+            start = int(parsed.get("start_line", 1))
+            end   = int(parsed.get("end_line", 1))
+            exec_result = _reason_read_range(file, start, end, config)
+            if exec_result and exec_result.get("success"):
+                lines = exec_result.get("lines", 0)
+                entry = f"Round {round_num}: read_range {file} lines {start}-{end} → {lines} lines returned"
+                console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]{lines} lines returned[/#abb2bf]")
+            else:
+                error = exec_result.get("error", "file not found")
+                entry = f"Round {round_num}: read_range {file} → failed: {error}"
+                console.print(f"  [#e06c75]✗[/#e06c75] [#abb2bf]failed: {error}[/#abb2bf]")
+
+        elif action == "edit":
+            start = int(parsed.get("start_line", 1))
+            end   = int(parsed.get("end_line", 1))
+            new_content = parsed.get("new_content", "")
+            exec_result = _reason_edit(file, start, end, new_content, config)
+            if exec_result and exec_result.get("success"):
+                diff_preview = exec_result.get("diff_preview", "")
+                entry = f"Round {round_num}: edit {file} lines {start}-{end} → success, diff: {diff_preview}"
+                if diff_preview:
+                    added   = sum(1 for ln in diff_preview.splitlines() if ln.startswith("+") and not ln.startswith("+++"))
+                    removed = sum(1 for ln in diff_preview.splitlines() if ln.startswith("-") and not ln.startswith("---"))
+                    console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]diff: +{added} -{removed}[/#abb2bf]")
+                    show_diff(diff_preview, title=f"edit — {file}")
+                    _broadcast({"type": "diff", "title": f"edit — {file}", "diff": diff_preview})
+                else:
+                    console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]edit applied[/#abb2bf]")
+                steps_executed.append({
+                    "action": "edit", "file": file, "success": True,
+                    "error": None, "diff_preview": diff_preview,
+                })
+            else:
+                error = exec_result.get("error", "unknown error")
+                entry = f"Round {round_num}: edit {file} lines {start}-{end} → failed: {error}"
+                steps_executed.append({
+                    "action": "edit", "file": file, "success": False,
+                    "error": error, "diff_preview": None,
+                })
+                console.print(f"  [#e06c75]✗[/#e06c75] [#abb2bf]failed: {error}[/#abb2bf]")
+
+        elif action == "create":
+            file_content = parsed.get("content", "")
+            exec_result = _reason_create(file, file_content, config)
+            if exec_result and exec_result.get("success"):
+                entry = f"Round {round_num}: create {file} → success"
+                console.print(f"  [#00ffaa]✓[/#00ffaa] [#abb2bf]created[/#abb2bf]")
+                _broadcast({"type": "diff", "title": f"create — {file}", "diff": f"+++ {file}"})
+                steps_executed.append({
+                    "action": "create", "file": file, "success": True,
+                    "error": None, "diff_preview": None,
+                })
+            else:
+                error = exec_result.get("error", "unknown error")
+                entry = f"Round {round_num}: create {file} → failed: {error}"
+                steps_executed.append({
+                    "action": "create", "file": file, "success": False,
+                    "error": error, "diff_preview": None,
+                })
+                console.print(f"  [#e06c75]✗[/#e06c75] [#abb2bf]failed: {error}[/#abb2bf]")
+
+        elif action == "delete":
+            exec_result = _reason_delete(file, config)
+            if exec_result and exec_result.get("success"):
+                entry = f"Round {round_num}: delete {file} → success"
+                steps_executed.append({
+                    "action": "delete", "file": file, "success": True,
+                    "error": None, "diff_preview": None,
+                })
+            else:
+                error = (exec_result or {}).get("error", "unknown error")
+                entry = f"Round {round_num}: delete {file} → failed: {error}"
+                steps_executed.append({
+                    "action": "delete", "file": file, "success": False,
+                    "error": error, "diff_preview": None,
+                })
+                console.print(f"  [#e06c75]✗ {error}[/#e06c75]")
+
+        else:
+            entry = f"Round {round_num}: unknown action '{action}' → skipped"
+            console.print(f"  [#e06c75]✗ unknown action: {action}[/#e06c75]")
+
+        action_history.append(entry)
+
+        # Feed result back to main for next round
+        messages.append({"role": "assistant", "content": content})
+        messages.append({"role": "user", "content": (
+            f"Action result:\n{entry}\n\n"
+            f"## Full Action History\n" + "\n".join(action_history) + "\n\n"
+            "Respond with the next JSON action, or {\"done\": true, \"summary\": \"...\"} if finished."
+        )})
+
+    # ---------------------------------------------------------------------
+    # If max rounds hit without done, force a final summary call
+    # ---------------------------------------------------------------------
+    if not done:
+        console.print(
+            f"  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] "
+            f"[#5c6370]→ max rounds reached, requesting summary[/#5c6370]"
+        )
+        messages.append({"role": "user", "content": (
+            f"You have reached the maximum number of rounds ({max_rounds}).\n"
+            f"## Full Action History\n" + "\n".join(action_history) + "\n\n"
+            "You MUST stop now. Output ONLY: {\"done\": true, \"summary\": \"<your summary>\"}"
+        )})
+        final_result = _stream_to_console(
+            stream_llm(provider, model, messages, max_tokens=1024),
+            show_thinking=False,
+        )
+        total_input  += final_result.get("input_tokens", 0)
+        total_output += final_result.get("output_tokens", 0)
+
+        final_content = final_result["content"].strip()
+        if final_content.startswith("```"):
+            final_content = final_content.split("```")[1]
+            if final_content.startswith("json"):
+                final_content = final_content[4:]
+            final_content = final_content.strip()
+        try:
+            final_parsed = json.loads(final_content)
+            summary_text = final_parsed.get("summary", final_content)
+        except Exception:
+            summary_text = final_content
+
+    # ---------------------------------------------------------------------
+    # Batch commit all staged changes
+    # ---------------------------------------------------------------------
     from votor.tools import git_commit_staged
     successful_files = [s["file"] for s in steps_executed if s["success"]]
     if successful_files:
         files_summary = ", ".join(successful_files[:3])
         if len(successful_files) > 3:
             files_summary += f" +{len(successful_files) - 3} more"
-        git_commit_staged(f"votor: edit session — {files_summary}")
+        git_commit_staged(f"votor: reason session — {files_summary}")
         console.print(
             f"  [#00ffaa]✓[/#00ffaa] [#5c6370]committed {len(successful_files)} file(s)[/#5c6370]"
         )
 
-    # -------------------------------------------------------------------------
-    # Phase 4: Verification (if enabled)
-    # -------------------------------------------------------------------------
-    from votor.tools import git_log, read_file as read_file_tool
-    recent_commits = git_log(limit=len(write_plan))
-    verify_changes = config.get("verify_changes", False)
-
-    if verify_changes:
-        # Read full current contents of all edited/created files
-        changed_files = list({
-            step["file"] for step in steps_executed
-            if step["success"] and step["action"] in ("edit", "create")
-        })
-
-        file_contents_after = {}
-        for f in changed_files:
-            result = read_file_tool(f)
-            if result.get("exists"):
-                file_contents_after[f] = result["content"]
-
-        # Build diffs from steps_executed
-        diffs = [
-            s["diff_preview"] for s in steps_executed
-            if s.get("diff_preview")
-        ]
-
-        verify_messages = [
-            {"role": "system", "content": prompts["verify_changes_prompt"]},
-            {"role": "user",   "content": (
-                f"## User Request\n\n{question}\n\n"
-                f"## Changes Made (diffs)\n\n" + "\n\n".join(diffs) + "\n\n"
-                f"## Full File Contents After Edit\n\n" +
-                "\n\n".join(f"### {f}\n```\n{c}\n```" for f, c in file_contents_after.items())
-            )}
-        ]
-
-        console.print(f"\n  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ verifying changes[/#5c6370]")
-
-        from votor.providers import stream_llm
-        verify_result = _stream_to_console(
-            stream_llm(provider, model, verify_messages, max_tokens=1024),
-            show_thinking=False
-        )
-        total_input  += verify_result.get("input_tokens", 0)
-        total_output += verify_result.get("output_tokens", 0)
-
-        # Append verification result to summary context
-        verification_note = f"## Verification Result\n\n{verify_result['content']}"
-    else:
-        verification_note = ""
-
-    # -------------------------------------------------------------------------
-    # Phase 5: Main summarizes results
-    # -------------------------------------------------------------------------
-    summary_messages = [
-        {"role": "system", "content": prompts["write_summary_prompt"]},
-        {"role": "user",   "content": (
-            f"## User Request\n\n{question}\n\n"
-            f"## Plan That Was Executed\n\n{json.dumps(write_plan, indent=2)}\n\n"
-            f"## Execution Results\n\n{json.dumps(steps_executed, indent=2)}\n\n"
-            f"## Git Commits Made\n\n{json.dumps(recent_commits, indent=2)}\n\n"
-            + verification_note
-        )}
-    ]
-
-    console.print(f"\n  [#5c6370]main[/#5c6370] [#c678dd]{provider}/{model}[/#c678dd] [#5c6370]→ summarizing results[/#5c6370]")
-
-    from votor.providers import stream_llm
-    summary_result = _stream_to_console(
-        stream_llm(provider, model, summary_messages, max_tokens=1024),
-        show_thinking=False
-    )
-    total_input  += summary_result.get("input_tokens", 0)
-    total_output += summary_result.get("output_tokens", 0)
+    console.print()
 
     return {
-        "answer":         summary_result["content"],
+        "answer":         summary_text,
         "steps_executed": steps_executed,
         "input_tokens":   total_input,
         "output_tokens":  total_output,
@@ -1142,58 +1163,55 @@ def run_query(
 
     # Write intent — route to edit mode
     if classification["intent"] == "write":
-        write_mode = config.get("write_mode", "edit")
+        t0 = time.time()
+        edit_result = run_edit_mode(
+            question=question,
+            config=config,
+            base_context=base_context,
+            classification=classification,
+        )
+        t_llm = round(time.time() - t0, 2)
 
-        if write_mode == "edit":
-            t0 = time.time()
-            edit_result = run_edit_mode(
-                question=question,
-                config=config,
-                base_context=base_context,
-                classification=classification,
-            )
-            t_llm = round(time.time() - t0, 2)
+        # Auto /update after edit to re-index changed files
+        try:
+            from votor.indexer import index_project
+            from votor.db import close_client
+            invalidate_full_context_cache()
+            console.print(f"\n  [#5c6370]auto-updating index...[/#5c6370]")
+            close_client()  # release Qdrant lock before re-opening in indexer
+            index_project(incremental=True, force=False, config=config)
+            invalidate_full_context_cache()
+            console.print(f"  [#00ffaa]✓[/#00ffaa] [#5c6370]index updated[/#5c6370]\n")
+        except Exception as e:
+            console.print(f"  [#e06c75]index update failed: {e}[/#e06c75]\n")
 
-            # Auto /update after edit to re-index changed files
-            try:
-                from votor.indexer import index_project
-                from votor.db import close_client
-                invalidate_full_context_cache()
-                console.print(f"\n  [#5c6370]auto-updating index...[/#5c6370]")
-                close_client()  # release Qdrant lock before re-opening in indexer
-                index_project(incremental=True, force=False, config=config)
-                invalidate_full_context_cache()
-                console.print(f"  [#00ffaa]✓[/#00ffaa] [#5c6370]index updated[/#5c6370]\n")
-            except Exception as e:
-                console.print(f"  [#e06c75]index update failed: {e}[/#e06c75]\n")
+        elapsed = round(time.time() - start_time, 2)
+        cost    = calculate_cost(
+            model=edit_result["model"],
+            input_tokens=edit_result["input_tokens"],
+            output_tokens=edit_result["output_tokens"]
+        )
 
-            elapsed = round(time.time() - start_time, 2)
-            cost    = calculate_cost(
-                model=edit_result["model"],
-                input_tokens=edit_result["input_tokens"],
-                output_tokens=edit_result["output_tokens"]
-            )
-
-            return {
-                "answer":          edit_result["answer"],
-                "model":           edit_result["model"],
-                "provider":        edit_result["provider"],
-                "input_tokens":    edit_result["input_tokens"],
-                "output_tokens":   edit_result["output_tokens"],
-                "total_tokens":    edit_result["input_tokens"] + edit_result["output_tokens"],
-                "cost":            cost,
-                "response_time":   elapsed,
-                "retrieval_score": avg_score,
-                "savings_pct":     0,
-                "tokens_saved":    0,
-                "t_embed":         t_embed,
-                "t_retrieve":      t_retrieve,
-                "t_classify":      t_classify,
-                "t_sub_tools":     0.0,
-                "t_llm":           t_llm,
-                "sources":         sources,
-                "error":           None,
-            }
+        return {
+            "answer":          edit_result["answer"],
+            "model":           edit_result["model"],
+            "provider":        edit_result["provider"],
+            "input_tokens":    edit_result["input_tokens"],
+            "output_tokens":   edit_result["output_tokens"],
+            "total_tokens":    edit_result["input_tokens"] + edit_result["output_tokens"],
+            "cost":            cost,
+            "response_time":   elapsed,
+            "retrieval_score": avg_score,
+            "savings_pct":     0,
+            "tokens_saved":    0,
+            "t_embed":         t_embed,
+            "t_retrieve":      t_retrieve,
+            "t_classify":      t_classify,
+            "t_sub_tools":     0.0,
+            "t_llm":           t_llm,
+            "sources":         sources,
+            "error":           None,
+        }
 
     if classification["intent"] == "read":
         console.print(f"  [#5c6370]sub[/#5c6370] [#c678dd]{sub_provider}/{sub_model}[/#c678dd] [#5c6370]→ tool loop  files=[/#5c6370][#61afef]{classification['files']}[/#61afef]")
