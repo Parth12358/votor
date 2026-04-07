@@ -1,4 +1,4 @@
-# This file contains analytics functions for tracking and reporting metrics in the application.
+import sqlite3
 import json
 from pathlib import Path
 from datetime import datetime
