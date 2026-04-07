@@ -1,4 +1,5 @@
-import sqlite3
+# Analytics helpers for tracking, summarizing, and reporting project/query activity.
+from __future__ import annotations
 import json
 from pathlib import Path
 from datetime import datetime
