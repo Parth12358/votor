@@ -3,9 +3,9 @@
 ---
 
 ## Completed
-
-| Area | What was done |
-|---|---|
+1. /forget command — wipe all conversation chunks without touching code index
+2. Cross-session memory vs session-only memory
+3. Whether conversation chunks should be excluded from edit mode context
 | Read path hardening | Path traversal, size limits, encoding warning, dedup cache, truncation |
 | Structural chunking | pygments-based boundary chunking replacing word-count |
 | Sub agent (read) | Intent classification, tool execution, prompts externalized |
