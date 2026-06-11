@@ -3,6 +3,7 @@
 > A project-aware coding assistant powered by a local vector database that travels with your code.
 
 ---
+jvjbv
 
 ## What is votor?
 
